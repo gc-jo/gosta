@@ -8,6 +8,7 @@ create table branches (
   name_ar text not null,
   kind    text not null,
   active  boolean not null default true,
+  constraint branches_id_not_blank check (btrim(id) <> ''),
   constraint branches_name_ar_not_blank check (btrim(name_ar) <> ''),
   constraint branches_kind_valid check (kind in ('branch', 'warehouse', 'waste'))
 );
@@ -20,6 +21,7 @@ create table items (
   item_type  text not null,
   sort_order int not null default 0,
   active     boolean not null default true,
+  constraint items_id_not_blank check (btrim(id) <> ''),
   constraint items_name_ar_not_blank check (btrim(name_ar) <> ''),
   constraint items_base_unit_not_blank check (btrim(base_unit) <> ''),
   constraint items_item_type_valid
@@ -37,11 +39,12 @@ create table item_units (
   constraint item_units_rate_positive check (conversion_rate > 0)
 );
 
--- Every item's base unit must exist in item_units with rate 1.
+-- Every item's base unit must exist in item_units with rate 1 and be active.
 -- Deferred so an item and its units can be inserted in either order
 -- within one transaction.
 create function app.check_item_base_unit() returns trigger
-language plpgsql as $$
+language plpgsql
+set search_path = app, public, extensions, pg_temp as $$
 declare
   v_key     text := case tg_table_name when 'items' then 'id' else 'item_id' end;
   v_item_id text;
@@ -55,15 +58,16 @@ begin
     ]) as t(x)
     where x is not null
   loop
-    if exists (select 1 from items i where i.id = v_item_id)
+    if exists (select 1 from public.items i where i.id = v_item_id)
        and not exists (
          select 1
-         from items i
-         join item_units u
-           on u.item_id = i.id and u.unit_name = i.base_unit and u.conversion_rate = 1
+         from public.items i
+         join public.item_units u
+           on u.item_id = i.id and u.unit_name = i.base_unit
+          and u.conversion_rate = 1 and u.active
          where i.id = v_item_id
        ) then
-      raise exception 'item % must have its base unit in item_units with conversion_rate 1', v_item_id
+      raise exception 'item % must have an active base unit in item_units with conversion_rate 1', v_item_id
         using errcode = '23514';
     end if;
   end loop;
@@ -87,6 +91,7 @@ create table suppliers (
   name_ar text not null,
   phone   text null,
   active  boolean not null default true,
+  constraint suppliers_id_not_blank check (btrim(id) <> ''),
   constraint suppliers_name_ar_not_blank check (btrim(name_ar) <> '')
 );
 

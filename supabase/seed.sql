@@ -61,9 +61,15 @@ insert into seed_users values
   ('215', 'مدير التالف', 'manager',     'BR-15', '1515', true),
   ('299', 'مدير موقوف', 'manager',     'BR-01', '9999', false);
 
-insert into auth.users (id, aud, role, email)
-select ('b0000000-0000-4000-8000-' || lpad(emp, 12, '0'))::uuid,
-       'authenticated', 'authenticated', emp || '@gosta.invalid'
+-- String token columns are set to '' (not NULL) so GoTrue can read the rows.
+insert into auth.users (
+  instance_id, id, aud, role, email, email_confirmed_at,
+  confirmation_token, recovery_token, email_change, email_change_token_new, reauthentication_token
+)
+select '00000000-0000-0000-0000-000000000000'::uuid,
+       ('b0000000-0000-4000-8000-' || lpad(emp, 12, '0'))::uuid,
+       'authenticated', 'authenticated', emp || '@gosta.invalid', now(),
+       '', '', '', '', ''
 from seed_users;
 
 insert into app_users (auth_user_id, employee_number, name, role, branch_id, active)
@@ -116,6 +122,7 @@ create function test.act_as_service() returns void
 language plpgsql as $$
 begin
   reset role;
+  perform set_config('request.jwt.claims', '{"role":"service_role"}', true);
   set local role service_role;
 end;
 $$;
