@@ -145,7 +145,7 @@ rollback;
   - Text primary keys: `branches.id`, `items.id`, `suppliers.id`.
   - `item_units` primary key `(item_id, unit_name)`; check `conversion_rate > 0`. A deferred constraint trigger requires that `items.base_unit` exists in `item_units` for that item with `conversion_rate = 1`.
   - `branch_features.feature_key` check in (`receive`,`send`,`purchase`,`count`,`balance`); primary key `(branch_id, feature_key)`. A missing row means visible.
-  - `app_users(id uuid primary key default gen_random_uuid(), auth_user_id uuid unique null references auth.users(id), employee_number text unique not null check (employee_number ~ '^[0-9]+$'), name text not null, role text not null, branch_id text null references branches, active boolean not null default true, failed_attempts int not null default 0, locked_until timestamptz null)`; check `(role = 'owner') = (branch_id is null)`. There is **no** `session_expires_at` column.
+  - `app_users(id uuid primary key default gen_random_uuid(), auth_user_id uuid unique null references auth.users(id), employee_number text unique not null check (employee_number ~ '^[0-9]+$'), name text not null, role text not null, branch_id text null references branches, active boolean not null default true, failed_attempts int not null default 0, locked_until timestamptz null, credential_version int not null default 0)`; check `(role = 'owner') = (branch_id is null)`. There is **no** `session_expires_at` column.
   - `app_user_secrets(user_id uuid primary key references app_users, secret_hash text not null)`.
   - `app_sessions(session_id uuid primary key, user_id uuid not null references app_users, created_at timestamptz not null default clock_timestamp(), expires_at timestamptz not null, revoked_at timestamptz null)`; index on `user_id`.
   - Enumerations are `text` + check constraints, not Postgres enums.
@@ -189,7 +189,7 @@ rollback;
   - `count_lines`: `state` check in (`uncounted`,`counted`,`none`); `revision int not null default 0`; `needs_recount boolean not null default false`; `effective_at timestamptz null`; check `(state = 'uncounted') = (base_quantity is null)`.
   - `stock_movements.kind` check in (`transfer_out`,`transfer_in`,`transfer_adjust`,`purchase_in`,`purchase_adjust`). Index `(branch_id, item_id, occurred_at)`.
   - `stock_baselines.source` check in (`count`,`owner_zero`). Index `(branch_id, item_id, effective_at desc)`.
-  - `rpc_requests(request_id uuid primary key, rpc_name text not null, user_id uuid not null, request_hash text not null, result jsonb not null, created_at timestamptz not null default clock_timestamp())`.
+  - `rpc_requests(request_id uuid primary key, rpc_name text not null, user_id uuid not null, request_hash text not null, secret_verifier text null, result jsonb not null, created_at timestamptz not null default clock_timestamp())`.
   - Trigger function `app.forbid_update_delete()` raising `IMMUTABLE_ROW`, attached `before update or delete` to the four insert-only tables.
   - View `balances` (`with (security_invoker = true)`), one row per (active branch × active item):
 
@@ -249,7 +249,8 @@ rollback;
   - `app.unit_rate(p_item_id text, p_unit text, p_allow_inactive boolean default false) returns numeric` — `ITEM_INVALID` (missing or inactive item), `UNIT_INVALID` (no such unit, or inactive and not allowed).
   - `app.check_quantity(p_quantity numeric, p_allow_zero boolean) returns numeric` — `QUANTITY_INVALID` for null, negative, or zero when not allowed.
   - `app.request_replay(p_request_id uuid, p_rpc_name text, p_user_id uuid, p_params jsonb) returns jsonb` — takes `pg_advisory_xact_lock(hashtextextended('req:' || p_request_id, 0))`. No row → null. Row with the same `rpc_name`, `user_id` and `request_hash` → its `result`. Anything else → `REQUEST_ID_REUSED`. `request_hash = encode(digest(p_rpc_name || ':' || p_params::text, 'sha256'), 'hex')`; `p_params` is a `jsonb` built by the RPC from all its arguments except secrets.
-  - `app.request_store(p_request_id uuid, p_rpc_name text, p_user_id uuid, p_params jsonb, p_result jsonb) returns jsonb` — inserts and returns `p_result`.
+  - `app.request_store(p_request_id uuid, p_rpc_name text, p_user_id uuid, p_params jsonb, p_result jsonb, p_secret text default null) returns jsonb` — inserts and returns `p_result`. When `p_secret` is given it stores `secret_verifier = crypt(p_secret, gen_salt('bf', 10))`: a verifier that belongs to this request and never changes afterwards.
+  - `app.request_secret_ok(p_request_id uuid, p_secret text) returns boolean` — `crypt(p_secret, secret_verifier) = secret_verifier` for that request row.
   - `app.log_action(p_user_id uuid, p_action text, p_entity_table text, p_entity_id text, p_details jsonb) returns void`.
   - `app.normalize_digits(p text) returns text` — `immutable`; maps `٠-٩` and `۰-۹` to `0-9`.
 
@@ -368,7 +369,7 @@ Rules beyond spec section 6.2:
 - `receive_transfer`: read `from_branch`, `to_branch` from the transfer (immutable); caller's branch must equal `to_branch` (`FORBIDDEN`); lock destination; `require_feature(dest,'receive')`; `require_not_frozen(dest)`. `select … from transfer_lines where transfer_id = … for update order by id`, then evaluate. `p_lines` must be exactly the set of pending line ids (`LINES_INCOMPLETE`); no pending lines → `LINE_NOT_PENDING`. Received quantity ≥ 0.
   - **Receipt conversion.** If the received unit equals the line's sent unit, `received_unit_rate := the line's stored unit_rate` — whatever the unit's current rate or active flag. Otherwise `received_unit_rate := app.unit_rate(item, unit)` (must be active). `received_base_quantity = quantity × received_unit_rate`. So "as sent" always equals `base_quantity` exactly.
   - If `received_base_quantity <> base_quantity`, `diff_reason` is required (`DIFF_REASON_REQUIRED`). No `transfer_in` row when received is 0. `transfer_in.occurred_at = v_now`. `transfer_adjust` at the source = `base_quantity − received_base_quantity` (negative when overloaded), `occurred_at` = `transfers.created_at`. `cost_total := round(cost_total × received_base / base, 3)` when cost is not null.
-- `owner_resolve_transfer_line`: role `owner`. Read the line's transfer to learn the branches; for `accept` and `edit_accept` lock the destination and `require_not_frozen` it; then `select … for update` the line and only then check `status = 'pending'` (`LINE_NOT_PENDING`). `edit_accept` requires `p_quantity > 0` and an active `p_unit`; it writes `transfer_adjust` at the source for `old_base − new_base` dated at the send time, updates `quantity`/`unit`/`unit_rate`/`base_quantity`, scales cost, then accepts in full. `deny`: `transfer_adjust` +`base_quantity` at the source dated at the send time; no destination movement; no branch lock. All three set `resolved_by_owner = true`.
+- `owner_resolve_transfer_line`: role `owner`. Read the line's transfer to learn the branches; for `accept` and `edit_accept` lock the destination and `require_not_frozen` it; then `select … for update` the line and only then check `status = 'pending'` (`LINE_NOT_PENDING`). `edit_accept` requires `p_quantity > 0` and `p_unit`; the rate follows the **edit conversion rule** of Task 7 (same unit → the line's stored `unit_rate`; different unit → that unit's current active rate); it writes `transfer_adjust` at the source for `old_base − new_base` dated at the send time, updates `quantity`/`unit`/`unit_rate`/`base_quantity`, scales cost, then accepts in full. `deny`: `transfer_adjust` +`base_quantity` at the source dated at the send time; no destination movement; no branch lock. All three set `resolved_by_owner = true`.
 - Every path sets `resolved_by`, `resolved_at` (`v_now`, or `clock_timestamp()` for `deny`).
 
 - [ ] **Step 1: Write the failing tests `06_transfers.test.sql`.** Each asserts with `test.balance` and row checks. Baseline for arithmetic tests: `301` sends `BR-14 → BR-01`: `D-001` 2 `كرتونة` (18000 مل) cost 40, and `D-002` 1 `كرتونة` (1000) cost 10.
@@ -399,6 +400,7 @@ Rules beyond spec section 6.2:
 | owner accept | `balance(BR-01,D-001) = 18000`, `resolved_by_owner = true` |
 | owner deny | `balance(BR-14,D-001) = 0`, `balance(BR-01,D-001) = 0`, status `denied` |
 | owner edit_accept | edit to 1 `كرتونة` → `balance(BR-14,D-001) = -9000`, `balance(BR-01,D-001) = 9000`, `cost_total = 20.000` |
+| owner edit_accept after a rate change | set (`D-001`,`كرتونة`) to 8000 after the send; `edit_accept` to 1 `كرتونة` → `balance(BR-01,D-001) = 9000` (stored rate), not 8000 |
 | adjust dated at send time | insert a `BR-14` baseline for `D-001` of 50000 with `effective_at = clock_timestamp()` between the send and the receipt; receive short by 9000 → `balance(BR-14,D-001) = 50000` |
 | frozen source / destination | `test.freeze('BR-14')` → send raises `BRANCH_FROZEN`; `test.freeze('BR-01')` → send to it succeeds, receive and owner `accept` raise `BRANCH_FROZEN`, owner `deny` succeeds |
 | expired session | `test.expire_session('201')`, receive → `NOT_AUTHENTICATED`, no rows written |
@@ -423,7 +425,8 @@ Rules beyond spec section 6.2:
 Rules beyond spec section 6.3:
 
 - `create_purchase`: roles `manager`, `distributor`; branch = caller's; lock branch; `require_feature(branch,'purchase')`; `require_not_frozen(branch)`; supplier exists and active (`SUPPLIER_INVALID`); each item has an active `supplier_items` row for that supplier **and** an active `allowed_local_purchases` row for the branch (`ITEM_NOT_ALLOWED`); quantity > 0; cost rule identical to `send_transfer`. `created_at` and `purchase_in.occurred_at` = `v_now`.
-- `edit_purchase_line`: owner only. `select … for update` the line **first**; every value used to compute the adjustment is read after that lock. Voided → `LINE_VOIDED`; quantity > 0; history row `action = 'edit'`, `old_values` = `{quantity, unit, unit_rate, base_quantity, cost_total}`; one `purchase_adjust` of `new_base − old_base` dated at the purchase's `created_at` (none when the difference is 0); `unit_rate` = current rate of the new unit. No branch lock; allowed while frozen.
+- `edit_purchase_line`: owner only. `select … for update` the line **first**; every value used to compute the adjustment is read after that lock. Voided → `LINE_VOIDED`; quantity > 0; history row `action = 'edit'`, `old_values` = `{quantity, unit, unit_rate, base_quantity, cost_total}`; one `purchase_adjust` of `new_base − old_base` dated at the purchase's `created_at` (none when the difference is 0). No branch lock; allowed while frozen.
+  - **Edit conversion rule.** If `p_unit` equals the line's current unit, the line's stored `unit_rate` is kept, whatever the catalog says today and whether or not the unit is still active; `new_base = p_quantity × stored unit_rate`. Only when `p_unit` differs is the rate looked up: `app.unit_rate(item, p_unit)` (must be active), and that rate is stored on the line. So an edit that changes only the cost writes no movement, ever.
 - `void_purchase_line`: owner only; same lock-first rule; already voided → `LINE_VOIDED`; history `action = 'void'`; `purchase_adjust` of `−base_quantity` dated at `created_at`.
 
 - [ ] **Step 1: Write the failing tests `07_purchases.test.sql`**
@@ -440,6 +443,10 @@ Rules beyond spec section 6.3:
 | frozen | `test.freeze('BR-01')` → `BRANCH_FROZEN` |
 | edit | owner edits to 1 `عبوة`, cost 5 → balance `750`; one history row with `old_values->>'base_quantity' = '2250'` |
 | two edits in sequence | 3 → 2 → 1 `عبوة` → balance `750` = line `base_quantity`; two history rows |
+| **cost-only edit after a rate change** | buy 3 `عبوة` (2250); `update item_units set conversion_rate = 1000` for (`D-001`,`عبوة`); owner edits the line to 3 `عبوة`, cost 9 → no `purchase_adjust` row, `base_quantity = 2250`, `unit_rate = 750`, balance `2250`, `cost_total = 9` |
+| quantity edit after a rate change | same set-up; edit to 2 `عبوة` → `base_quantity = 1500`, balance `1500` |
+| deliberate unit change after a rate change | same set-up; edit to 3000 `مل` → `unit_rate = 1`, balance `3000`; then edit back to 3 `عبوة` → `unit_rate = 1000`, balance `3000` (the unit changed, so today's rate applies) |
+| edit in the same deactivated unit | deactivate (`D-001`,`عبوة`); edit quantity 3 → 2 `عبوة` → ok; edit to a different inactive unit → `UNIT_INVALID` |
 | edit by manager | → `FORBIDDEN` |
 | void | → balance `0`, `voided_at` set, history `action = 'void'` |
 | void twice / edit voided | → `LINE_VOIDED` |
@@ -477,7 +484,8 @@ Rules:
   - In a `returned` count only lines with `needs_recount = true` may be saved (`COUNT_LOCKED`).
   - `p_state` in (`counted`,`none`,`uncounted`). `counted`: `p_entries` is a non-empty array of `{"unit","quantity"}`, each unit active for the item, each quantity ≥ 0, no unit twice (`ENTRIES_INVALID`); `base_quantity` = Σ quantity × current rate. `none`: entries null or `[]`; `base_quantity = 0`. `uncounted`: clears entries, `base_quantity = null`.
   - This generic `entries` shape launches if the per-type rules file is late (spec section 8, "Open"). Per-type shapes arrive as a later migration that only widens validation.
-  - No `p_request_id`: the revision check makes a duplicate delivery fail with `STALE_WRITE`, which the client treats as "already saved, refetch".
+  - No `p_request_id`: the revision check makes a duplicate delivery fail with `STALE_WRITE`.
+  - **`STALE_WRITE` means "this save was not applied", never "already saved".** The line may hold this phone's earlier duplicate or another phone's different value; the database cannot tell which. Contract for the client (built in plan 3, fixed here): keep the employee's entry on screen, refetch the line, compare stored `state` + `entries` with what the employee intended. Equal → mark saved and adopt the new revision. Different → show both values as a conflict and let the employee choose; choosing theirs re-saves with the fresh revision. The client must never show "تم الحفظ" on `STALE_WRITE` without that comparison.
 - `discard_count`: owner; lock branch; row lock; status must be `draft` or `returned` (`COUNT_NOT_OPEN`); deletes the lines and the count row, which lifts the freeze. Discarding a `returned` count throws the whole count away — the only way out of an abandoned recount; the owner screen must say so.
 
 - [ ] **Step 1: Write the failing tests `08_count_entry.test.sql`**
@@ -490,6 +498,7 @@ Rules:
 | freeze blocks | after start, before any save: `create_purchase` by `201` → `BRANCH_FROZEN` |
 | save | `D-001` rev 0, counted `[{"unit":"كرتونة","quantity":1},{"unit":"عبوة","quantity":2}]` → `base_quantity = 10500`, `line_revision = 1`, `count_revision = 1`, `counted = 1`, `total = 2` |
 | **stale save rejected** | save `D-001` rev 1 with 12 `عبوة` (→ rev 2); then a late save with `p_expected_revision = 1` and 10 `عبوة` → `STALE_WRITE`; stored `base_quantity = 9000` |
+| stale duplicate is also rejected | re-send the identical 12 `عبوة` save with `p_expected_revision = 1` → `STALE_WRITE`; line `revision` still 2 (the database does not guess; the client compares) |
 | none state | `D-002` state `none` → `base_quantity = 0` |
 | blank is not zero | `counted` with `[]` → `ENTRIES_INVALID` |
 | duplicate unit | → `ENTRIES_INVALID` |
@@ -572,9 +581,9 @@ Rules:
 Rules:
 
 - The secret is never part of `p_params`, `rpc_requests.result` or `activity_log.details`.
-- **Replay with a secret.** When `request_replay` returns a stored result for `admin_create_user` or `admin_set_secret`, compare before returning it: `crypt(clean_secret, secret_hash) = secret_hash` for the target user, else `REQUEST_ID_REUSED`. A retry with the same secret replays; a retry with a different one is refused.
+- **Replay with a secret.** `admin_create_user` and `admin_set_secret` pass the cleaned secret to `request_store`, which keeps a verifier on the request row itself. When `request_replay` returns a stored result, the RPC returns it only if `app.request_secret_ok(p_request_id, clean_secret)`, else `REQUEST_ID_REUSED`. The comparison is against the original request, not the user's current hash, so a later PIN change cannot alter the answer. A replay never changes the stored PIN.
 - `admin_create_user`: employee number normalised with `normalize_digits`; duplicate → `EMPLOYEE_NUMBER_TAKEN`; role/branch mismatch or unknown branch → `USER_INVALID`. `auth_user_id` stays null until first login.
-- `admin_set_secret` and `admin_set_user_active(false)` call `app.revoke_sessions`. `admin_set_secret` also zeroes `failed_attempts` and `locked_until`. Row-lock the `app_users` row first.
+- `admin_set_secret` and `admin_set_user_active(false)` call `app.revoke_sessions` and set `credential_version = credential_version + 1`, both under the user-row lock. `admin_set_secret` also zeroes `failed_attempts` and `locked_until`. Row-lock the `app_users` row first.
 - `admin_set_user_active(false)` on the caller's own row → `USER_INVALID`.
 - `admin_set_secret` on an owner row is allowed only for the caller's own row; it revokes the owner's other sessions but not the calling one.
 
@@ -594,7 +603,9 @@ Rules:
 | self-deactivate | → `USER_INVALID` |
 | logout | `test.act_as('202')`; `select logout()`; `app.session_ok()` = false |
 | secret replay | `admin_set_secret` twice with the same id and PIN → same result; same id, different PIN → `REQUEST_ID_REUSED` and the stored hash still matches the first PIN |
-| secret not leaked | no `rpc_requests` row (`result::text`, `request_hash`) or `activity_log.details::text` contains `4444` |
+| **secret replay after an intervening change** | request A sets `201` to `1111`; request B sets it to `2222`; retry A with `1111` → A's stored result, and the user's hash **still matches `2222`**, `credential_version` unchanged by the retry; reuse A's id with `2222` → `REQUEST_ID_REUSED` |
+| version advances | `credential_version` goes up by 1 on each real `admin_set_secret` and on deactivation, and not on `admin_unlock_user` |
+| secret not leaked | no `rpc_requests` row (`result::text`, `request_hash`, `secret_verifier`) or `activity_log.details::text` contains `4444` |
 | feature toggle | hide `purchase` for `BR-01` → `create_purchase` by `201` raises `FEATURE_HIDDEN` |
 
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0009_rpc_users.sql`.** **Step 4: Run.** Expected: PASS.
@@ -609,9 +620,9 @@ Rules:
 
 **Interfaces:**
 - Produces (in `public`, each granted to `service_role` **only**):
-  - `login_verify(p_employee_number text, p_secret text) returns jsonb` — never raises for a bad credential. Returns `{"ok": true, "user_id": uuid, "auth_user_id": uuid|null, "employee_number": text}` or `{"ok": false, "reason": "invalid"|"locked", "locked_until": timestamptz|null}`.
+  - `login_verify(p_employee_number text, p_secret text) returns jsonb` — never raises for a bad credential. Returns `{"ok": true, "user_id": uuid, "auth_user_id": uuid|null, "employee_number": text, "credential_version": int}` or `{"ok": false, "reason": "invalid"|"locked", "locked_until": timestamptz|null}`.
   - `login_attach_auth_user(p_user_id uuid) returns uuid` — finds `auth.users` by `email = <employee_number>@gosta.invalid`; if the app row's `auth_user_id` is null, sets it; returns the app row's `auth_user_id` (null when no such Auth user exists). Row-locks the `app_users` row, so concurrent calls agree.
-  - `login_register_session(p_user_id uuid, p_session_id uuid) returns void` — inserts `app_sessions` with `expires_at = clock_timestamp() + interval '7 days'`; `on conflict (session_id) do nothing`; raises `USER_INVALID` if the user is missing or inactive.
+  - `login_register_session(p_user_id uuid, p_session_id uuid, p_credential_version int) returns void` — `select … for update` the user row, then raises `USER_INVALID` if the user is missing, inactive, or `credential_version <> p_credential_version` (the secret was reset, or the user deactivated, after this login was verified). Otherwise inserts `app_sessions` with `expires_at = clock_timestamp() + interval '7 days'`; `on conflict (session_id) do nothing`. Because reset and registration take the same row lock, a login is either registered before the reset (and revoked by it) or refused after it.
 
 Rules:
 
@@ -636,7 +647,9 @@ Rules:
 | logged | three `activity_log` rows for three attempts, none containing the secret |
 | attach repairs | create user `206` (no Auth user); insert an `auth.users` row with email `206@gosta.invalid`; `login_verify('206', pin)` → `auth_user_id` equals that row's id |
 | attach is stable | `login_attach_auth_user` twice → same id; a second `auth.users` row cannot be attached to an already attached user |
-| register session | `login_register_session(user, gen_random_uuid())` → one row expiring ≈ +7 days; for inactive `299` → `USER_INVALID` |
+| register session | `login_register_session(user, gen_random_uuid(), <version from login_verify>)` → one row expiring ≈ +7 days; for inactive `299` → `USER_INVALID` |
+| **login in flight during a reset** | `login_verify('201','1111')` → version v; as owner `admin_set_secret('201', '7777')`; as service `login_register_session(user, new id, v)` → `USER_INVALID`; `201` has no unrevoked session |
+| login in flight during a deactivation | same with `admin_set_user_active(false)` → `USER_INVALID` |
 | not callable by clients | `test.act_as('201')`; each of the three functions → `42501` |
 
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0010_login.sql`.** **Step 4: Run.** Expected: PASS.
@@ -670,7 +683,7 @@ Flow, every step safe to repeat:
 2. If `auth_user_id` is null: `auth.admin.createUser({ email, password: derived, email_confirm: true })`. An "already registered" error is **not** a failure (an earlier attempt or a simultaneous login got there first). Then `login_attach_auth_user(user_id)`; a null result → 500.
 3. If the user was attached in this request, `auth.admin.updateUserById(auth_user_id, { password: derived })` — the Auth user found by email is only trusted after its password is set to ours.
 4. Anon client `signInWithPassword(email, derived)`. On failure for an existing user (derive secret rotated), do step 3 once and retry.
-5. `login_register_session(user_id, sessionIdFromJwt(access_token))`.
+5. `login_register_session(user_id, sessionIdFromJwt(access_token), credential_version)` with the version from step 1. If it raises `USER_INVALID`, sign the just-created Auth session out with the admin API (best effort) and return 401 `INVALID_CREDENTIALS`; the unregistered token is useless either way.
 6. Return the session. The service-role key and the derived password never appear in a response or log line.
 
 - [ ] **Step 1: Write the failing unit tests `derive_test.ts`**
@@ -704,6 +717,7 @@ Deno.test("sessionIdFromJwt reads the claim and rejects a token without it", () 
 | lockout | five wrong for `202` → 423 with `locked_until` |
 | **reset, re-login, old tokens** | login `201` → tokens A. Owner `rpc/admin_set_secret` to `7777`. Login `201`/`7777` → tokens B (200). Then: access token A reads zero rows from `items` and gets `NOT_AUTHENTICATED` from an RPC; refreshing with refresh token A, if GoTrue still issues a token, yields one that is refused the same way; tokens B work |
 | logout | `rpc/logout` with tokens B → the same access token is refused afterwards |
+| registration refused end to end | with the service key call `login_verify` for `202`, then `admin_set_secret` as owner, then `login_register_session` with the stale version → error; a token obtained by signing in directly against Auth for `202` (derived password) but never registered reads zero rows from `items` |
 | bad body | `{}` → 400 |
 
 - [ ] **Step 6: Run.** Expected: FAIL (404). **Step 7: Implement `index.ts`.** **Step 8: Run.** Expected: PASS.

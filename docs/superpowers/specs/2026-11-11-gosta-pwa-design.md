@@ -105,7 +105,7 @@ Timestamps are stored in UTC and shown in `Asia/Amman`. Inventory periods are ca
 | `supplier_items` | `supplier_id`, `item_id`, `active` |
 | `allowed_local_purchases` | `branch_id`, `item_id`, `active` |
 | `branch_features` | `branch_id`, `feature_key` (`receive`, `send`, `purchase`, `count`, `balance`), `visible` |
-| `app_users` | `id`, `auth_user_id` (unique, null until first login), `employee_number` (unique), `name`, `role` (`manager` \| `distributor` \| `owner`), `branch_id` (null for owner), `active`, `failed_attempts`, `locked_until` |
+| `app_users` | `id`, `auth_user_id` (unique, null until first login), `employee_number` (unique), `name`, `role` (`manager` \| `distributor` \| `owner`), `branch_id` (null for owner), `active`, `failed_attempts`, `locked_until`, `credential_version` |
 | `app_user_secrets` | `user_id`, `secret_hash` — readable by no client role |
 | `app_sessions` | `session_id` (the Supabase Auth session id), `user_id`, `created_at`, `expires_at`, `revoked_at` — one row per login; readable by no client role |
 
@@ -151,7 +151,7 @@ Known limit: a 4-digit PIN can still be guessed in days of patient trying, and a
 ### Sessions
 
 - The phone stays signed in for 7 days; a logout button is always visible.
-- Every RPC and every row-level-security policy checks that the user is active and that the token's own session (`session_id` claim) exists in `app_sessions`, is not revoked and has not expired. Deactivating a user or resetting their PIN revokes all their sessions; a later login creates a new session and does not revive an old one, so an old token or refresh token stays dead.
+- Every RPC and every row-level-security policy checks that the user is active and that the token's own session (`session_id` claim) exists in `app_sessions`, is not revoked and has not expired. Deactivating a user or resetting their PIN revokes all their sessions; a later login creates a new session and does not revive an old one, so an old token or refresh token stays dead. A reset also advances the user's `credential_version`; a login that was verified with the old PIN but had not finished when the reset happened is refused at the last step.
 - Logout revokes the current session on the server.
 
 ### Permissions (enforced in the database)
@@ -199,15 +199,20 @@ Because consumption is not recorded, a balance means "last count plus what came 
 ### 6.3 Purchases
 
 - **Create** (`create_purchase`): validates the supplier is active, each item is sold by that supplier and allowed for the branch, unit valid, quantity > 0, cost present if the user is a distributor. Writes a `purchase_in` movement per line.
-- **Owner edit** (`edit_purchase_line`): saves old values to history, updates the line, writes a `purchase_adjust` movement for the difference, dated at the original purchase time.
+- **Owner edit** (`edit_purchase_line`): saves old values to history, updates the line, writes a `purchase_adjust` movement for the difference, dated at the original purchase time. If the unit is unchanged the line keeps the conversion rate it was recorded with, so editing only the cost never changes stock, even if the catalog rate has changed since. Only a deliberate change of unit uses today's rate. The same rule applies when the owner edits a pending transfer.
 - **Owner void** (`void_purchase_line`): saves history, marks the line voided, writes a reversing movement dated at the original purchase time.
 
 Dating corrections at the original event time means a correction to something that happened before the latest approved count does not disturb the current balance — the count already captured reality.
 
 ### 6.4 Counts and baselines
 
-- **Start.** The manager presses "بدء الجرد" to begin; nothing is created and nothing is frozen before that. The start screen states the physical rules and requires a tick to confirm them: count at a quiet time and in one sitting; a delivery that arrives during the count is put aside, not shelved and not counted, and is received in the app after the count is submitted; nothing is sent out until then. Stock consumed during the count is not captured — consumption is not recorded at all in this version (section 6.1) — which is the reason for "quiet time, one sitting".
-- **Freeze.** From that start until the count is submitted, the branch is frozen: receive, send, purchase, owner-accept of a transfer into it, and zeroing are refused. Nothing moves while stock is being counted, so the submit time is a true "as of" moment. Corrections dated in the past (section 6.3, deny, receipt adjustments at the source) are still allowed; they fall before the baseline.
+- **Start.** The manager presses "بدء الجرد" to begin; nothing is created and nothing is frozen before that. The start screen states the physical rules and requires a tick to confirm each:
+  1. **Books first.** Every delivery already on the shelf has been received in the app, and everything already sent out has been recorded as a transfer. The screen lists this branch's shipments still waiting to be received and asks, for each, whether it is physically here; if one is, the manager must receive it before starting.
+  2. **No stock use.** The count is done while the branch is not serving — before opening or after closing — and in one sitting.
+  3. **Arrivals wait.** A delivery that arrives during the count is put aside, not shelved and not counted, and is received in the app after the count is submitted.
+  4. **Nothing leaves** until the count is submitted.
+- **What is guaranteed and what is not.** The freeze guarantees that no *recorded* movement falls inside the count. It cannot see stock being used. The approved count equals the real stock at submission only if rules 1–4 were followed; a branch that counts while serving gets an opening balance that is wrong by whatever it used during the count, and the system cannot detect it. Rule 2 is therefore a condition of the count being valid, not advice.
+- **Freeze.** From that start until the count is submitted, the branch is frozen: receive, send, purchase, owner-accept of a transfer into it, and zeroing are refused. No recorded movement can fall inside the count, so, given the physical rules above, the submit time is a true "as of" moment. Corrections dated in the past (section 6.3, deny, receipt adjustments at the source) are still allowed; they fall before the baseline.
 - The manager sees a banner on every tab while frozen. The owner sees which branches are frozen and since when, and can discard a draft count (or a returned count abandoned mid-recount), which deletes its entries and lifts the freeze. An abandoned count therefore cannot block a branch for longer than the owner allows.
 - Approving a count writes one `stock_baselines` row per item (0 for "لا يوجد"), `effective_at` = that line's `effective_at`. Movements after that moment apply on top.
 - **Recount.** When the owner returns selected items, the branch freezes again from the moment the manager presses start on the recount until resubmission. Recounted lines take the resubmit time as `effective_at`; untouched lines keep the original submit time.
@@ -269,7 +274,7 @@ Fixed by this design:
 2. Manager counts **blind** (no expected quantity shown). Items in sort order, with search, a progress indicator, and a "remaining only" filter.
 3. Each item ends in one of two states: counted, or explicitly "لا يوجد". Blank is not zero.
 4. Multi-unit entry with conversion.
-5. Entries are saved to the server as a `draft` as they are typed; the manager can leave and resume on any device. Each save carries the revision it was based on; a late or duplicated save is rejected instead of overwriting newer work, and a save can never create a count or start a freeze.
+5. Entries are saved to the server as a `draft` as they are typed; the manager can leave and resume on any device. Each save carries the revision it was based on; a late or duplicated save is rejected instead of overwriting newer work, and a save can never create a count or start a freeze. A rejected save is never reported as saved: the app keeps what the employee typed, reloads the stored value and compares; if they match it is marked saved, and if another phone stored something different both values are shown and the employee chooses.
 6. Submit is disabled until every item has a state. A summary screen precedes confirmation, and the submission names the revision that summary showed; if anything changed since, it is refused and the summary reloads. After submit the count is locked for the manager.
 7. Owner approves, or returns the whole count or selected items with a note; the manager recounts only those and resubmits.
 8. Approval creates the baselines (section 6.4).
