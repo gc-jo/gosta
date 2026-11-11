@@ -12,6 +12,7 @@ jobs:
       - uses: supabase/setup-cli@v1
         with:
           version: latest
+      - run: supabase --version
       - run: supabase db start
       - run: supabase test db
       - uses: denoland/setup-deno@v2
