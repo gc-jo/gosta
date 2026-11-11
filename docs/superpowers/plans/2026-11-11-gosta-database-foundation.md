@@ -88,6 +88,8 @@ legacy/                               src/Code.js, src/index.html moved here unc
 
 Each seeded user has an `auth.users` row (`email = <employee_number>@gosta.invalid`), `auth_user_id` set, and one `app_sessions` row with a fixed `session_id` expiring in 7 days. `BR-03` and user `203` are reserved for the concurrency tests (Task 13), which commit data; pgTAP tests must not depend on `BR-03` being empty.
 
+As built in Task 2: the base unit row of every item must exist, have rate 1 **and be active** (deferred constraint trigger; inside a pgTAP transaction it fires only at commit or after `set constraints all immediate`); ids of branches, items and suppliers cannot be blank; seeded `auth.users` rows carry `instance_id`, `email_confirmed_at` and empty-string token columns so Supabase Auth can load them; `test.act_as_service` sets the claims to `{"role":"service_role"}`.
+
 Test helpers in schema `test` (seed only, never in a migration):
 
 - `test.act_as(p_employee_number text) returns void` — `set local role authenticated`; sets `request.jwt.claims` to `{"sub": <auth_user_id>, "role": "authenticated", "session_id": <seeded session id>}`.
@@ -178,7 +180,7 @@ rollback;
 
 **Files:**
 - Create: `supabase/migrations/0002_operations.sql`, `supabase/migrations/0003_ledger.sql`, `supabase/tests/03_ledger.test.sql`
-- Modify: `supabase/seed.sql` (add `test.freeze`)
+- Modify: `supabase/seed.sql` (add `test.freeze` and `test.balance`; Task 2 deliberately left both out because their tables and view did not exist yet)
 
 **Interfaces:**
 - Produces: tables per spec section 4, with these explicit additions and constraints:
@@ -227,7 +229,7 @@ select * from finish();
 rollback;
 ```
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write both migrations and `test.freeze`.** **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write both migrations, `test.freeze` and `test.balance`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): operations tables, insert-only ledger, balances view`.
 
 ---
@@ -653,6 +655,7 @@ Rules:
 | **login in flight during a reset** | `login_verify('201','1111')` → version v; as owner `admin_set_secret('201', '7777')`; as service `login_register_session(user, new id, v)` → `USER_INVALID`; `201` has no unrevoked session |
 | login in flight during a deactivation | same with `admin_set_user_active(false)` → `USER_INVALID` |
 | not callable by clients | `test.act_as('201')`; each of the three functions → `42501` |
+| server role keeps execute | `has_function_privilege('service_role', …, 'execute')` is true for each of the three functions, and one of them is actually called after `test.act_as_service()` (deferred from Task 1 by the owner: first server-only functions) |
 
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0010_login.sql`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): login verification, lockout, session registration`.
