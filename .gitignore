@@ -1,16 +1,11 @@
-# clasp credentials — NEVER commit
-.clasprc.json
-**/.clasprc.json
-
-# local clasp scratch clones
-.verify/
-
 node_modules/
 .DS_Store
 
 # supabase local scratch
 supabase/.temp/
 supabase/.branches/
+supabase/.env
+supabase/.env.*
 
 # agent working files
 .superpowers/

@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 3.1.0
       - run: supabase --version
       - run: supabase db start
       - run: supabase test db
