@@ -7,3 +7,10 @@
 
 node_modules/
 .DS_Store
+
+# supabase local scratch
+supabase/.temp/
+supabase/.branches/
+
+# agent working files
+.superpowers/
