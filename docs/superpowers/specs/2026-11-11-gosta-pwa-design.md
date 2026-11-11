@@ -206,6 +206,8 @@ Dating corrections at the original event time means a correction to something th
 
 ### 6.4 Counts and baselines
 
+> **Pending owner confirmation (raised 2026-11-11).** The physical counting procedure below — pausing stock use and movement, recording existing deliveries first, setting new arrivals aside — is not yet confirmed as workable for every branch. Nothing in section 6.4 or section 8 that depends on it is built until the owner confirms; if any branch cannot follow it, the freeze design is revisited.
+
 - **Start.** The manager presses "بدء الجرد" to begin; nothing is created and nothing is frozen before that. The start screen states the physical rules and requires a tick to confirm each:
   1. **Books first.** Every delivery already on the shelf has been received in the app, and everything already sent out has been recorded as a transfer. The screen lists this branch's shipments still waiting to be received and asks, for each, whether it is physically here; if one is, the manager must receive it before starting.
   2. **No stock use.** The count is done while the branch is not serving — before opening or after closing — and in one sitting.

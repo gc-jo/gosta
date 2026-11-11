@@ -460,6 +460,8 @@ Rules beyond spec section 6.3:
 
 ### Task 8: Count windows, explicit start, revisioned drafts
 
+> **Blocked: pending owner confirmation of the physical counting procedure** (spec section 6.4). Do not start Task 8 or Task 9 until the owner confirms. Tasks 1–7 and 10–12 do not depend on it.
+
 **Files:**
 - Create: `supabase/migrations/0008_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
 
