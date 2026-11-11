@@ -204,7 +204,7 @@ Dating corrections at the original event time means a correction to something th
 ### 6.4 Counts and baselines
 
 - **Freeze.** From the first entry saved in a count until that count is submitted, the branch is frozen: receive, send, purchase, owner-accept of a transfer into it, and zeroing are refused. Nothing moves while stock is being counted, so the submit time is a true "as of" moment. Corrections dated in the past (section 6.3, deny, receipt adjustments at the source) are still allowed; they fall before the baseline.
-- The manager sees a banner on every tab while frozen. The owner sees which branches are frozen and since when, and can discard a draft count, which deletes its entries and lifts the freeze. An abandoned count therefore cannot block a branch for longer than the owner allows.
+- The manager sees a banner on every tab while frozen. The owner sees which branches are frozen and since when, and can discard a draft count (or a returned count abandoned mid-recount), which deletes its entries and lifts the freeze. An abandoned count therefore cannot block a branch for longer than the owner allows.
 - Approving a count writes one `stock_baselines` row per item (0 for "لا يوجد"), `effective_at` = that line's `effective_at`. Movements after that moment apply on top.
 - **Recount.** When the owner returns selected items, the branch freezes again from the first recount entry until resubmission. Recounted lines take the resubmit time as `effective_at`; untouched lines keep the original submit time.
 - **Zero a balance** writes baselines of 0 for every item in the branch, effective now.
