@@ -92,7 +92,7 @@ Two Supabase projects (the free plan's limit): `gosta-test` and `gosta-live`. Sc
 
 ## 4. Data model
 
-Timestamps are stored in UTC and shown in `Asia/Amman`. Inventory periods are calendar months in `Asia/Amman`. Quantities are `numeric`. Every operational row stores both the entered quantity + unit and the `base_quantity` in the item's base unit.
+Timestamps are stored in UTC and shown in `Asia/Amman`. Inventory periods are calendar months in `Asia/Amman`. Quantities are `numeric`. Every operational row stores the entered quantity + unit, the conversion rate in force at that moment (`unit_rate`), and the `base_quantity` in the item's base unit. A stored `base_quantity` is never recomputed when a rate later changes.
 
 ### Reference data (owner-managed)
 
@@ -105,8 +105,9 @@ Timestamps are stored in UTC and shown in `Asia/Amman`. Inventory periods are ca
 | `supplier_items` | `supplier_id`, `item_id`, `active` |
 | `allowed_local_purchases` | `branch_id`, `item_id`, `active` |
 | `branch_features` | `branch_id`, `feature_key` (`receive`, `send`, `purchase`, `count`, `balance`), `visible` |
-| `app_users` | `id`, `auth_user_id` (unique, null until first login), `employee_number` (unique), `name`, `role` (`manager` \| `distributor` \| `owner`), `branch_id` (null for owner), `active`, `failed_attempts`, `locked_until`, `session_expires_at` |
+| `app_users` | `id`, `auth_user_id` (unique, null until first login), `employee_number` (unique), `name`, `role` (`manager` \| `distributor` \| `owner`), `branch_id` (null for owner), `active`, `failed_attempts`, `locked_until` |
 | `app_user_secrets` | `user_id`, `secret_hash` — readable by no client role |
+| `app_sessions` | `session_id` (the Supabase Auth session id), `user_id`, `created_at`, `expires_at`, `revoked_at` — one row per login; readable by no client role |
 
 Foreign keys and check constraints make the dirty data found in the current sheet (units for missing items, blank suppliers, a branch id typed into a status column) impossible to enter.
 
@@ -120,8 +121,8 @@ Foreign keys and check constraints make the dirty data found in the current shee
 | `purchase_lines` | `id`, `purchase_id`, `item_id`, `quantity`, `unit`, `base_quantity`, `cost_total` (nullable), `voided_at`, `voided_by` |
 | `purchase_line_history` | `id`, `purchase_line_id`, `changed_by`, `changed_at`, `action` (`edit` \| `void`), `old_values` (json) |
 | `count_windows` | `branch_id`, `period_month`, `status` (`open` \| `closed`), `opened_by`, `opened_at`, `closed_by`, `closed_at` — one row per branch and month |
-| `counts` | `id`, `branch_id`, `period_month`, `status` (`draft` \| `submitted` \| `returned` \| `approved`), `submitted_by`, `submitted_at`, `reviewed_by`, `reviewed_at`, `review_note`, `frozen_since` (null when the branch is not frozen by this count) — one count per branch and month |
-| `count_lines` | `count_id`, `item_id`, `state` (`uncounted` \| `counted` \| `none`), `entries` (json: per-unit inputs; shape per item type, section 8), `base_quantity`, `needs_recount` (bool), `effective_at` (the submit time of the round in which this line was last counted) |
+| `counts` | `id`, `branch_id`, `period_month`, `status` (`draft` \| `submitted` \| `returned` \| `approved`), `submitted_by`, `submitted_at`, `reviewed_by`, `reviewed_at`, `review_note`, `frozen_since` (null when the branch is not frozen by this count), `revision` — one count per branch and month |
+| `count_lines` | `count_id`, `item_id`, `state` (`uncounted` \| `counted` \| `none`), `entries` (json: per-unit inputs; shape per item type, section 8), `base_quantity`, `needs_recount` (bool), `revision`, `effective_at` (the submit time of the round in which this line was last counted) |
 
 ### Ledger
 
@@ -130,7 +131,7 @@ Foreign keys and check constraints make the dirty data found in the current shee
 | `stock_movements` | `id`, `branch_id`, `item_id`, `base_quantity` (signed), `kind`, `ref_table`, `ref_id`, `occurred_at`, `created_by`, `created_at` |
 | `stock_baselines` | `id`, `branch_id`, `item_id`, `base_quantity`, `effective_at`, `source` (`count` \| `owner_zero`), `ref_id`, `created_by` |
 | `activity_log` | `id`, `at`, `user_id`, `action`, `entity_table`, `entity_id`, `details` (json) |
-| `rpc_requests` | `request_id`, `rpc_name`, `user_id`, `result` (json), `created_at` — backs section 6.5 |
+| `rpc_requests` | `request_id`, `rpc_name`, `user_id`, `request_hash`, `result` (json), `created_at` — backs section 6.5 |
 | `backup_runs` | `id`, `at`, `ok`, `size_bytes` |
 
 Ledger and log rows are insert-only. Nothing is updated or deleted.
@@ -141,7 +142,7 @@ Ledger and log rows are insert-only. Nothing is updated or deleted.
 
 1. The app sends employee number + secret to the `login` Edge Function. The secret is a 4-digit PIN for managers and distributors and a password of at least 12 characters for the owner.
 2. The function rejects if the user is missing, inactive, or locked. It verifies the secret against a salted slow hash. Five consecutive failures lock the account for 15 minutes. Every attempt is logged. The check and the lockout counter live in one database function, so they are covered by the database tests.
-3. On success it signs the user in to Supabase Auth with a long server-derived secret (never the PIN itself, never known to the client), creating the Auth user on first login, sets `session_expires_at` to 7 days ahead, and returns the session.
+3. On success it signs the user in to Supabase Auth with a long server-derived secret (never the PIN itself, never known to the client), creating the Auth user on first login, records that login in `app_sessions` with an expiry 7 days ahead, and returns the session. Provisioning is resumable: if an earlier attempt created the Auth user but did not finish, or two first logins arrive together, the next attempt completes it. Public sign-up is disabled in Supabase Auth.
 
 Secrets are never stored in plain text and the hashes are readable only by the server. PINs are set and reset only by the owner through the app. The owner's own password is reset from the Supabase dashboard if it is lost.
 
@@ -150,7 +151,8 @@ Known limit: a 4-digit PIN can still be guessed in days of patient trying, and a
 ### Sessions
 
 - The phone stays signed in for 7 days; a logout button is always visible.
-- Every RPC and every row-level-security policy checks `active = true` and `now() < session_expires_at`. Deactivating a user or resetting their PIN ends their access immediately.
+- Every RPC and every row-level-security policy checks that the user is active and that the token's own session (`session_id` claim) exists in `app_sessions`, is not revoked and has not expired. Deactivating a user or resetting their PIN revokes all their sessions; a later login creates a new session and does not revive an old one, so an old token or refresh token stays dead.
+- Logout revokes the current session on the server.
 
 ### Permissions (enforced in the database)
 
@@ -188,6 +190,7 @@ Because consumption is not recorded, a balance means "last count plus what came 
   - `transfer_in` at the destination: +received, `occurred_at` = now.
   - If received ≠ sent, `transfer_adjust` at the source: +(sent − received), `occurred_at` = the original send time. Net effect: the source's stock went down by exactly what the destination received.
   - `cost_total` is scaled by received ÷ sent.
+  - A receipt entered in the same unit as the send is converted with the rate stored on the line when it was sent, so "received as sent" always equals the sent quantity even if the unit's rate was changed or the unit deactivated in between.
 - **Owner accept**: same as a receipt in full, marked `resolved_by_owner`.
 - **Owner deny**: line becomes `denied`; `transfer_adjust` returns the full sent quantity to the source (dated at the send time).
 - **Owner edit**: changes the sent quantity/unit of a pending line (adjusting the source movement), then accepts it.
@@ -203,15 +206,22 @@ Dating corrections at the original event time means a correction to something th
 
 ### 6.4 Counts and baselines
 
-- **Freeze.** From the first entry saved in a count until that count is submitted, the branch is frozen: receive, send, purchase, owner-accept of a transfer into it, and zeroing are refused. Nothing moves while stock is being counted, so the submit time is a true "as of" moment. Corrections dated in the past (section 6.3, deny, receipt adjustments at the source) are still allowed; they fall before the baseline.
+- **Start.** The manager presses "بدء الجرد" to begin; nothing is created and nothing is frozen before that. The start screen states the physical rules and requires a tick to confirm them: count at a quiet time and in one sitting; a delivery that arrives during the count is put aside, not shelved and not counted, and is received in the app after the count is submitted; nothing is sent out until then. Stock consumed during the count is not captured — consumption is not recorded at all in this version (section 6.1) — which is the reason for "quiet time, one sitting".
+- **Freeze.** From that start until the count is submitted, the branch is frozen: receive, send, purchase, owner-accept of a transfer into it, and zeroing are refused. Nothing moves while stock is being counted, so the submit time is a true "as of" moment. Corrections dated in the past (section 6.3, deny, receipt adjustments at the source) are still allowed; they fall before the baseline.
 - The manager sees a banner on every tab while frozen. The owner sees which branches are frozen and since when, and can discard a draft count (or a returned count abandoned mid-recount), which deletes its entries and lifts the freeze. An abandoned count therefore cannot block a branch for longer than the owner allows.
 - Approving a count writes one `stock_baselines` row per item (0 for "لا يوجد"), `effective_at` = that line's `effective_at`. Movements after that moment apply on top.
-- **Recount.** When the owner returns selected items, the branch freezes again from the first recount entry until resubmission. Recounted lines take the resubmit time as `effective_at`; untouched lines keep the original submit time.
+- **Recount.** When the owner returns selected items, the branch freezes again from the moment the manager presses start on the recount until resubmission. Recounted lines take the resubmit time as `effective_at`; untouched lines keep the original submit time.
 - **Zero a balance** writes baselines of 0 for every item in the branch, effective now.
 
 ### 6.5 No double submissions
 
-Every write RPC takes a `request_id` generated by the app when the form opens. A repeated call with the same `request_id` returns the original result and changes nothing.
+Every write RPC takes a `request_id` generated by the app when the form opens. A repeated call with the same `request_id` and the same values returns the original result and changes nothing. The same `request_id` with different values is refused, so the app must generate a new id whenever the form's contents change after a failed attempt that it knows did not save.
+
+### 6.6 Concurrency and ordering
+
+- Any two operations that change the same record (a transfer line, a purchase line, a count) lock it first and then read it, so two simultaneous edits cannot both act on the old value.
+- Operations that write stock for a branch "now", and the start and submission of that branch's count, take the same per-branch lock. The time recorded for each is read after the lock is held, so the order of timestamps is the order in which things actually happened.
+- These rules are tested with two real simultaneous connections, not only in sequence.
 
 ## 7. Screens
 
@@ -259,8 +269,8 @@ Fixed by this design:
 2. Manager counts **blind** (no expected quantity shown). Items in sort order, with search, a progress indicator, and a "remaining only" filter.
 3. Each item ends in one of two states: counted, or explicitly "لا يوجد". Blank is not zero.
 4. Multi-unit entry with conversion.
-5. Entries are saved to the server as a `draft` as they are typed; the manager can leave and resume on any device.
-6. Submit is disabled until every item has a state. A summary screen precedes confirmation. After submit the count is locked for the manager.
+5. Entries are saved to the server as a `draft` as they are typed; the manager can leave and resume on any device. Each save carries the revision it was based on; a late or duplicated save is rejected instead of overwriting newer work, and a save can never create a count or start a freeze.
+6. Submit is disabled until every item has a state. A summary screen precedes confirmation, and the submission names the revision that summary showed; if anything changed since, it is refused and the summary reloads. After submit the count is locked for the manager.
 7. Owner approves, or returns the whole count or selected items with a note; the manager recounts only those and resubmits.
 8. Approval creates the baselines (section 6.4).
 
@@ -301,7 +311,9 @@ Each feature folder owns its screens, its data calls and its tests, and depends 
 
 ## 11. Testing
 
-- **Database tests** for every RPC: happy path, each validation, each permission boundary, idempotency, and ledger arithmetic (send/receive with differences, deny, owner edit, purchase edit/void before and after a baseline, count approval, zeroing).
+- **Database tests** for every RPC: happy path, each validation, each permission boundary, idempotency, and ledger arithmetic (send/receive with differences, changed conversion rates, deny, owner edit, purchase edit/void before and after a baseline, count approval, zeroing).
+- **Concurrency tests** on two real database connections: double receipt, receipt against owner resolution, two edits of one purchase, edit against void, and purchases racing the start and the submission of a count.
+- **Session tests**: after a PIN reset and a new login, the old access token and old refresh token are still refused.
 - **Replay check**: the real July–November transfers and purchases are replayed through the RPCs on the test project; totals in and out must reconcile.
 - **Front-end tests** for quantity/unit conversion, digit normalisation and form validation.
 - **Owner acceptance checklist** run on `gosta-test` on Nov 24–26.
