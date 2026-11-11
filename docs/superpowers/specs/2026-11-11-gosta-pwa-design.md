@@ -19,7 +19,7 @@ Users: 20–30 internal staff across 16 active branches in Jordan, on personal p
 
 Everything the current app does for its three roles, rebuilt with the same flows:
 
-- Login with employee number + 4-digit PIN.
+- Login with employee number + 4-digit PIN (staff) or employee number + password (owner).
 - Branch manager: receive transfers, send branch-to-branch transfers, local purchases, inventory count, balance view.
 - Distributor (warehouse): the same as a manager, plus a sent log (last 7 days) and required cost.
 - Owner: balances, purchases, transfers, counts, settings.
@@ -36,6 +36,9 @@ Changes from the current app:
 | C6 | On receipt, the quantity the receiver confirms is the real quantity for both branches (section 6.2). |
 | C7 | Inventory count is improved: save-and-continue, multi-unit entry, completeness enforced, owner review, approved count becomes the opening balance. Per-item-type entry screens are defined in a separate file from the owner (section 8). |
 | C8 | Balances are computed from a ledger, never stored. |
+| C9 | A branch is frozen (no receive, send or purchase) while its count is being entered (section 6.4). |
+| C10 | The owner signs in with a password of at least 12 characters, not a PIN. |
+| C11 | Every receipt whose quantity differs from the sent quantity is listed for the owner and shown to the sender. |
 
 ### Out of scope
 
@@ -82,7 +85,9 @@ Two Supabase projects (the free plan's limit): `gosta-test` and `gosta-live`. Sc
 
 - 500 MB database: current volume is about 1,000 rows/month, so this is not a practical limit. The owner settings screen shows current size.
 - Pause after 7 idle days: daily use and the nightly backup job prevent it.
-- No automatic backups: a nightly GitHub Actions job runs `pg_dump`, encrypts the file, and stores it as a workflow artifact (90-day retention). The repository must be private.
+- No automatic backups: a nightly GitHub Actions job runs `pg_dump` (through the Supabase session pooler, because GitHub runners have no IPv6), encrypts the file, and uploads it to a Cloudflare R2 bucket (free tier), keeping 90 days. The repository must be private.
+- GitHub disables scheduled workflows after 60 days without repository activity, which would stop both the backup and the keep-alive. Each run re-enables its own workflow through the GitHub API (to be confirmed at set-up), and each run records itself in a `backup_runs` table. The owner settings screen shows the last successful backup and turns red when it is older than 48 hours.
+- A backup that has never been restored is not a backup: once before launch and monthly after, the latest file is restored into `gosta-test` and row counts are compared.
 - Free-plan limits are to be confirmed on Supabase's official pricing page when the projects are set up.
 
 ## 4. Data model
@@ -100,7 +105,8 @@ Timestamps are stored in UTC and shown in `Asia/Amman`. Inventory periods are ca
 | `supplier_items` | `supplier_id`, `item_id`, `active` |
 | `allowed_local_purchases` | `branch_id`, `item_id`, `active` |
 | `branch_features` | `branch_id`, `feature_key` (`receive`, `send`, `purchase`, `count`, `balance`), `visible` |
-| `app_users` | `id` (= auth user id), `employee_number` (unique), `name`, `role` (`manager` \| `distributor` \| `owner`), `branch_id` (null for owner), `active`, `failed_attempts`, `locked_until`, `session_expires_at` |
+| `app_users` | `id`, `auth_user_id` (unique, null until first login), `employee_number` (unique), `name`, `role` (`manager` \| `distributor` \| `owner`), `branch_id` (null for owner), `active`, `failed_attempts`, `locked_until`, `session_expires_at` |
+| `app_user_secrets` | `user_id`, `secret_hash` — readable by no client role |
 
 Foreign keys and check constraints make the dirty data found in the current sheet (units for missing items, blank suppliers, a branch id typed into a status column) impossible to enter.
 
@@ -114,8 +120,8 @@ Foreign keys and check constraints make the dirty data found in the current shee
 | `purchase_lines` | `id`, `purchase_id`, `item_id`, `quantity`, `unit`, `base_quantity`, `cost_total` (nullable), `voided_at`, `voided_by` |
 | `purchase_line_history` | `id`, `purchase_line_id`, `changed_by`, `changed_at`, `action` (`edit` \| `void`), `old_values` (json) |
 | `count_windows` | `branch_id`, `period_month`, `status` (`open` \| `closed`), `opened_by`, `opened_at`, `closed_by`, `closed_at` — one row per branch and month |
-| `counts` | `id`, `branch_id`, `period_month`, `status` (`draft` \| `submitted` \| `returned` \| `approved`), `submitted_by`, `submitted_at`, `reviewed_by`, `reviewed_at`, `review_note` — one non-superseded count per branch and month |
-| `count_lines` | `count_id`, `item_id`, `state` (`uncounted` \| `counted` \| `none`), `entries` (json: per-unit inputs; shape per item type, section 8), `base_quantity`, `needs_recount` (bool) |
+| `counts` | `id`, `branch_id`, `period_month`, `status` (`draft` \| `submitted` \| `returned` \| `approved`), `submitted_by`, `submitted_at`, `reviewed_by`, `reviewed_at`, `review_note`, `frozen_since` (null when the branch is not frozen by this count) — one count per branch and month |
+| `count_lines` | `count_id`, `item_id`, `state` (`uncounted` \| `counted` \| `none`), `entries` (json: per-unit inputs; shape per item type, section 8), `base_quantity`, `needs_recount` (bool), `effective_at` (the submit time of the round in which this line was last counted) |
 
 ### Ledger
 
@@ -124,6 +130,8 @@ Foreign keys and check constraints make the dirty data found in the current shee
 | `stock_movements` | `id`, `branch_id`, `item_id`, `base_quantity` (signed), `kind`, `ref_table`, `ref_id`, `occurred_at`, `created_by`, `created_at` |
 | `stock_baselines` | `id`, `branch_id`, `item_id`, `base_quantity`, `effective_at`, `source` (`count` \| `owner_zero`), `ref_id`, `created_by` |
 | `activity_log` | `id`, `at`, `user_id`, `action`, `entity_table`, `entity_id`, `details` (json) |
+| `rpc_requests` | `request_id`, `rpc_name`, `user_id`, `result` (json), `created_at` — backs section 6.5 |
+| `backup_runs` | `id`, `at`, `ok`, `size_bytes` |
 
 Ledger and log rows are insert-only. Nothing is updated or deleted.
 
@@ -131,11 +139,13 @@ Ledger and log rows are insert-only. Nothing is updated or deleted.
 
 ### Login
 
-1. The app sends employee number + PIN to the `login` Edge Function.
-2. The function rejects if the user is missing, inactive, or locked. It verifies the PIN against a salted slow hash. Five consecutive failures lock the account for 15 minutes. Every attempt is logged.
-3. On success it signs the user in to Supabase Auth with a long server-derived secret (never the PIN itself, never known to the client), sets `session_expires_at` to 7 days ahead, and returns the session.
+1. The app sends employee number + secret to the `login` Edge Function. The secret is a 4-digit PIN for managers and distributors and a password of at least 12 characters for the owner.
+2. The function rejects if the user is missing, inactive, or locked. It verifies the secret against a salted slow hash. Five consecutive failures lock the account for 15 minutes. Every attempt is logged. The check and the lockout counter live in one database function, so they are covered by the database tests.
+3. On success it signs the user in to Supabase Auth with a long server-derived secret (never the PIN itself, never known to the client), creating the Auth user on first login, sets `session_expires_at` to 7 days ahead, and returns the session.
 
-The PIN is never stored in plain text. PINs are set and reset only by the owner through the app.
+Secrets are never stored in plain text and the hashes are readable only by the server. PINs are set and reset only by the owner through the app. The owner's own password is reset from the Supabase dashboard if it is lost.
+
+Known limit: a 4-digit PIN can still be guessed in days of patient trying, and anyone can lock a colleague out for 15 minutes by typing their employee number. This is accepted for staff accounts, whose reach is one branch and whose every action is logged; it is the reason the owner account does not use a PIN.
 
 ### Sessions
 
@@ -173,6 +183,7 @@ Because consumption is not recorded, a balance means "last count plus what came 
 ### 6.2 Transfers
 
 - **Send** (`send_transfer`): validates branch, items, units, quantities > 0, destination active and different from source, cost present if the sender is a distributor. Writes the transfer, its lines (`pending`), and one `transfer_out` movement per line (−`base_quantity`, source branch).
+- A send, receipt or purchase is refused with a plain-Arabic message while the acting branch is frozen by a count (section 6.4). Sending *to* a frozen branch is allowed; the shipment waits as pending.
 - **Receive** (`receive_transfer`): the receiver confirms every pending line of one transfer in one call. For each line: received quantity + unit; if it differs from sent, a reason is required. Writes:
   - `transfer_in` at the destination: +received, `occurred_at` = now.
   - If received ≠ sent, `transfer_adjust` at the source: +(sent − received), `occurred_at` = the original send time. Net effect: the source's stock went down by exactly what the destination received.
@@ -192,7 +203,10 @@ Dating corrections at the original event time means a correction to something th
 
 ### 6.4 Counts and baselines
 
-- Approving a count writes one `stock_baselines` row per counted item, `effective_at` = the moment the manager submitted. Movements after that moment apply on top.
+- **Freeze.** From the first entry saved in a count until that count is submitted, the branch is frozen: receive, send, purchase, owner-accept of a transfer into it, and zeroing are refused. Nothing moves while stock is being counted, so the submit time is a true "as of" moment. Corrections dated in the past (section 6.3, deny, receipt adjustments at the source) are still allowed; they fall before the baseline.
+- The manager sees a banner on every tab while frozen. The owner sees which branches are frozen and since when, and can discard a draft count, which deletes its entries and lifts the freeze. An abandoned count therefore cannot block a branch for longer than the owner allows.
+- Approving a count writes one `stock_baselines` row per item (0 for "لا يوجد"), `effective_at` = that line's `effective_at`. Movements after that moment apply on top.
+- **Recount.** When the owner returns selected items, the branch freezes again from the first recount entry until resubmission. Recounted lines take the resubmit time as `effective_at`; untouched lines keep the original submit time.
 - **Zero a balance** writes baselines of 0 for every item in the branch, effective now.
 
 ### 6.5 No double submissions
@@ -209,10 +223,10 @@ Visual design: keep the current app's look (emerald, Cairo font, rounded white c
 |---|---|
 | استلام | Shipments waiting for this branch, by sender and date. Open one; per line confirm as sent, or enter the real quantity + unit and pick a reason. Review, then confirm the shipment. |
 | تحويل | Pick destination; add items with quantity and unit (cost for distributor); review; send. |
-| شراء | Pick supplier; only items that supplier sells and the branch may buy are offered; quantity and unit (cost for distributor, optional for manager); review; save. |
+| شراء | Pick supplier; only items that supplier sells and the branch may buy are offered; quantity and unit (cost for distributor, optional for manager); review; save. Below the form: this branch's purchases today, read-only (the current app has this). |
 | جرد | Section 8. |
-| رصيد | Current balance per item in recognisable units, with the date of the last approved count. |
-| سجل الإرسال | Distributor only. Transfers sent in the last 7 days and each line's status. |
+| رصيد | Current balance per item in recognisable units, with the date of the last approved count. Until the branch has an approved count the tab shows "لا يوجد جرد افتتاحي بعد" instead of numbers. |
+| سجل الإرسال | Distributor only. Transfers sent in the last 7 days and each line's status. Lines received with a different quantity are highlighted with the received quantity and the reason. |
 
 ### Owner
 
@@ -220,9 +234,9 @@ Visual design: keep the current app's look (emerald, Cairo font, rounded white c
 |---|---|
 | الأرصدة | Balance for any branch and item. |
 | المشتريات | Filter by date range and branch; totals; edit or void a line. |
-| التحويلات | Filter by date range, branch, status. Stuck (pending) transfers listed first with accept, deny, edit. |
+| التحويلات | Filter by date range, branch, status. Stuck (pending) transfers listed first with accept, deny, edit. A "فروقات الاستلام" filter lists every line received with a different quantity: sender, receiver, sent, received, reason, note. |
 | الجرد | Open/close a window per branch and month; review submitted counts; approve or return (whole count or ticked items, with a note). Review flags any item counted above "opening + received", which is physically impossible. |
-| الإعدادات | Users (create, deactivate, reset PIN, unlock), feature visibility per branch, zero a balance, database size. |
+| الإعدادات | Users (create, deactivate, reset PIN, unlock), feature visibility per branch, zero a balance, database size, last successful backup. |
 
 ### Idiot-proofing rules (every screen)
 
@@ -297,7 +311,9 @@ Each feature folder owns its screens, its data calls and its tests, and depends 
 
 - `main` deploys to Cloudflare Pages automatically; migrations are applied to test, then live.
 - Nov 27–30: reference data imported to live, users created, app installed on phones, count windows opened for opening balances.
-- Dec 1: live. The old Apps Script deployment is disabled the same day.
+- Dec 1: live. The old Apps Script deployment is disabled for staff the same day; the Sheet and the script stay untouched for 14 days.
+- **Rollback.** Until Dec 15 the owner can re-enable the old deployment in minutes. Movements entered in the new app during that time would be re-keyed by hand from the owner's purchases and transfers screens; at about 35 rows a day this is tolerable for a few days and not beyond, so a rollback decision is made within the first week or not at all.
+- **Opening balances are a launch risk, not a detail.** No branch has ever finished a count, and balances stay blank until one is approved. Transfers and purchases work without a balance, so launch does not wait for counts, but the owner tracks the opening count per branch as a checklist and the acceptance test on Nov 24–26 includes one full count, start to approval, by a real branch manager.
 
 ## 13. Schedule
 
