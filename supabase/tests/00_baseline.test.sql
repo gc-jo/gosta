@@ -1,6 +1,4 @@
 begin;
--- pgTAP is test tooling and is deliberately not created by any migration.
-create extension if not exists pgtap with schema extensions;
 select plan(5);
 select has_extension('pgcrypto'); select has_extension('pgtap'); select has_schema('app');
 create function public.probe_pub() returns int language sql as 'select 1';
