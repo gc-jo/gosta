@@ -16,7 +16,7 @@ This is plan 1 of 4. Later plans, each written when the previous one is done: (2
 
 - The client never inserts, updates or deletes a table row. `anon` gets nothing. `authenticated` gets `select` (through RLS) and `execute` only on the entry points this plan names.
 - **Function privileges.** Migration `0000` revokes default `execute` from `public`, `anon` and `authenticated` for all future functions in `public` and `app`. Every later migration grants `execute` explicitly, one line per entry point. Nothing else is callable.
-- Every function is `security definer` with `set search_path = app, public, extensions, pg_temp` (`pg_temp` last), unless stated otherwise.
+- Every function is `security definer` with `set search_path = app, public, extensions, pg_temp` (`pg_temp` last), unless stated otherwise. Stated exceptions: `app.is_finite` (a pure expression used in check constraints; neither, so it stays inlinable; `service_role` has execute) and `app.forbid_update_delete` (only raises; has the search path, not definer).
 - Every RPC starts by calling `app.current_app_user()`; a missing or inactive user, or a missing, revoked or expired session, raises `NOT_AUTHENTICATED`.
 - **Lock order, always the same:** (1) request-id advisory lock inside `app.request_replay`; (2) branch locks via `app.lock_branches`, which sorts ids; (3) row locks with `select … for update` ordered by id. An RPC takes the row lock on any record it is going to change **before reading the values it bases the change on**.
 - **Branch lock rule.** An RPC calls `app.lock_branches` for every branch whose freeze it checks or changes, or to which it writes a movement or baseline dated "now". Movements dated in the past (corrections) need only the row lock.
@@ -198,7 +198,7 @@ rollback;
   - `stock_movements.kind` check in (`transfer_out`,`transfer_in`,`transfer_adjust`,`purchase_in`,`purchase_adjust`). Index `(branch_id, item_id, occurred_at)`.
   - `stock_baselines.source` check in (`count`,`owner_zero`). Index `(branch_id, item_id, effective_at desc)`.
   - `rpc_requests(request_id uuid primary key, rpc_name text not null, user_id uuid not null, request_hash text not null, secret_verifier text null, result jsonb not null, created_at timestamptz not null default clock_timestamp())`.
-  - Trigger function `app.forbid_update_delete()` raising `IMMUTABLE_ROW`, attached `before update or delete` to the four insert-only tables.
+  - Trigger function `app.forbid_update_delete()` raising `IMMUTABLE_ROW`, attached `before update or delete` (row level) and `before truncate` (statement level) to the four insert-only tables.
   - View `balances` (`with (security_invoker = true)`), one row per (active branch × active item):
 
 ```sql
@@ -206,7 +206,7 @@ rollback;
 -- base_quantity = latest baseline's quantity (0 if none)
 --               + sum(stock_movements.base_quantity) where occurred_at > that baseline's effective_at
 --                 (all movements when there is no baseline)
--- "latest" = greatest effective_at, ties broken by greatest id
+-- "latest" = greatest effective_at, ties broken by greatest seq (stock_baselines.seq is an identity column: the row written last wins)
 ```
 
 - [ ] **Step 1: Write the failing test `03_ledger.test.sql`** (inserts as postgres, direct to tables, explicit timestamps)
