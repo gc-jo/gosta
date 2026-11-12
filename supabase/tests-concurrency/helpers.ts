@@ -62,3 +62,20 @@ export async function waitUntilBlocked(admin: Conn, pid: number, timeoutMs = 500
   }
   throw new Error(`backend ${pid} was never blocked on a lock within ${timeoutMs} ms`);
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Makes the transaction already open on `c` act as an app session, the way a request through the
+ * Supabase API does: `set local role authenticated` plus request.jwt.claims carrying the Auth user
+ * id (`sub`) and the app session id (`session_id`). Call it right after `begin`; both settings end
+ * with the transaction.
+ */
+export async function actAsSession(c: Conn, authUserId: string, sessionId: string): Promise<void> {
+  if (!UUID_RE.test(authUserId) || !UUID_RE.test(sessionId)) {
+    throw new Error("actAsSession needs two uuids");
+  }
+  const claims = JSON.stringify({ sub: authUserId, role: "authenticated", session_id: sessionId });
+  await c.unsafe("set local role authenticated");
+  await c.unsafe("select set_config('request.jwt.claims', $1, true)", [claims]);
+}
