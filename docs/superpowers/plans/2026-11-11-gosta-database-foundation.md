@@ -51,18 +51,20 @@ supabase/
     0001_reference.sql                branches, items, item_units, suppliers, supplier_items,
                                       allowed_local_purchases, branch_features, app_users,
                                       app_user_secrets, app_sessions
-    0002_operations.sql               transfers, transfer_lines, purchases, purchase_lines,
+    0002_reference_hardening.sql      follow-up to 0001: finite-number check on conversion_rate,
+                                      base-unit rule made safe under concurrent transactions
+    0003_operations.sql               transfers, transfer_lines, purchases, purchase_lines,
                                       purchase_line_history, count_windows, counts, count_lines
-    0003_ledger.sql                   stock_movements, stock_baselines, activity_log, rpc_requests,
+    0004_ledger.sql                   stock_movements, stock_baselines, activity_log, rpc_requests,
                                       insert-only triggers, balances view
-    0004_helpers.sql                  schema app: session, validation, locking, idempotency, logging
-    0005_rls.sql                      table grants + policies
-    0006_rpc_transfers.sql            send_transfer, receive_transfer, owner_resolve_transfer_line
-    0007_rpc_purchases.sql            create_purchase, edit_purchase_line, void_purchase_line
-    0008_rpc_counts.sql               open/close_count_window, start_count, save_count_line,
+    0005_helpers.sql                  schema app: session, validation, locking, idempotency, logging
+    0006_rls.sql                      table grants + policies
+    0007_rpc_transfers.sql            send_transfer, receive_transfer, owner_resolve_transfer_line
+    0008_rpc_purchases.sql            create_purchase, edit_purchase_line, void_purchase_line
+    0009_rpc_counts.sql               open/close_count_window, start_count, save_count_line,
                                       discard_count, submit_count, review_count, zero_branch_balance
-    0009_rpc_users.sql                admin_* user RPCs, set_branch_feature, logout
-    0010_login.sql                    login_verify, login_attach_auth_user, login_register_session
+    0010_rpc_users.sql                admin_* user RPCs, set_branch_feature, logout
+    0011_login.sql                    login_verify, login_attach_auth_user, login_register_session
   functions/login/
     index.ts, derive.ts, derive_test.ts, login_integration_test.ts
   tests/                              pgTAP, one file per migration, plus 20_reconciliation
@@ -179,10 +181,14 @@ rollback;
 ### Task 3: Operations and ledger schema, balances view
 
 **Files:**
-- Create: `supabase/migrations/0002_operations.sql`, `supabase/migrations/0003_ledger.sql`, `supabase/tests/03_ledger.test.sql`
+- Create: `supabase/migrations/0002_reference_hardening.sql`, `supabase/migrations/0003_operations.sql`, `supabase/migrations/0004_ledger.sql`, `supabase/tests/02_hardening.test.sql`, `supabase/tests/03_ledger.test.sql`, `supabase/tests-concurrency/helpers.ts`, `supabase/tests-concurrency/base_unit_test.ts`
+- Modify: `.github/workflows/test.yml` (run the concurrency tests after the pgTAP step)
 - Modify: `supabase/seed.sql` (add `test.freeze` and `test.balance`; Task 2 deliberately left both out because their tables and view did not exist yet)
 
 **Interfaces:**
+- **Owner additions (2026-11-12).** Migration 0001 is accepted and is not edited; changes to its schema go in `0002_reference_hardening.sql`:
+  - **Finite numbers.** Postgres `numeric` accepts `NaN`, `Infinity` and `-Infinity`, and `NaN > 0` is true, so `conversion_rate > 0` does not stop `NaN`. Add `app.is_finite(numeric) returns boolean` (`immutable`, null → null) and a named check using it on `item_units.conversion_rate`. Every numeric column created in this task (`quantity`, `unit_rate`, `base_quantity`, `cost_total`, `received_quantity`, `received_unit_rate`, `received_base_quantity`, movement and baseline `base_quantity`, count line `base_quantity`) gets the same check, each named `<table>_<column>_finite`.
+  - **Base-unit rule under concurrency.** The rule is checked per transaction at commit, so two transactions that are each valid alone can together break it: one repoints `items.base_unit` to a second rate-1 unit while the other changes that unit's rate. Replace `app.check_item_base_unit` (`create or replace`, same triggers) so that it first takes `select … from public.items where id = … for update` on each affected item and then checks. The second transaction then waits and its check sees the first one's committed change.
 - Produces: tables per spec section 4, with these explicit additions and constraints:
   - All ids `uuid default gen_random_uuid()` except composite keys `count_windows (branch_id, period_month)` and `count_lines (count_id, item_id)`.
   - `transfer_lines`: `unit_rate numeric not null check (unit_rate > 0)`, `received_unit_rate numeric null`; check `base_quantity = quantity * unit_rate`; `status` check in (`pending`,`received`,`denied`); `diff_reason` check in (`overloaded`,`count_error`,`not_loaded`).
@@ -229,15 +235,29 @@ select * from finish();
 rollback;
 ```
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write both migrations, `test.freeze` and `test.balance`.** **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write migrations 0003 and 0004, `test.freeze` and `test.balance`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): operations tables, insert-only ledger, balances view`.
+- [ ] **Step 6: Write the failing test `02_hardening.test.sql`:** `NaN`, `Infinity` and `-Infinity` are each refused (`23514`) as `item_units.conversion_rate`; `app.is_finite` returns true for `0`, `-1.5`, `9000` and false for the three specials; and, after 0003/0004 exist, `NaN` and `Infinity` are refused in `stock_movements.base_quantity`, `stock_baselines.base_quantity`, `purchase_lines.quantity` and `transfer_lines.cost_total`.
+- [ ] **Step 7: Write `0002_reference_hardening.sql`; run.** Expected: PASS, and `01b_base_unit.test.sql` still passes unchanged.
+- [ ] **Step 8: Write the two-transaction test `supabase/tests-concurrency/base_unit_test.ts`** (Deno, `npm:postgres`, two dedicated connections to `postgresql://postgres:postgres@127.0.0.1:54322/postgres`; `helpers.ts` exports `connect()` only for now — Task 13 extends it). Each test creates its own item (`D-9xx`) with units `مل` ×1 and `لتر` ×1, commits, and cleans up after itself.
+
+| Test | A | B | Assertion |
+|---|---|---|---|
+| repoint vs rate change | `begin; update items set base_unit = 'لتر'` | `begin; update item_units set conversion_rate = 1000 where unit_name = 'لتر'; commit` (started after A's update, before A commits) | A commits first; B's commit is refused (`23514`); afterwards the item's base unit row has rate 1 |
+| rate change vs repoint | same two statements, B's transaction committing first | | the later commit is refused; the rule holds |
+| repoint vs deactivate | A repoints to `لتر` | B sets `active = false` on `لتر` | the later commit is refused; the base unit row is active |
+| control | A and B change two different items | | both commit |
+
+  Show RED once against 0001's function (before 0002 is applied, or with the `for update` line removed in a scratch database): the first test ends with a base unit of rate 1000.
+- [ ] **Step 9: Add the workflow step** after `supabase test db`: `deno test --allow-net=127.0.0.1:54322 --allow-env --allow-read --allow-sys supabase/tests-concurrency/` (move `denoland/setup-deno@v2` before it). Narrow the permissions to what the driver actually needs once CI shows them.
+- [ ] **Step 10: Commit** — `feat(db): finite-number checks, concurrency-safe base-unit rule`.
 
 ---
 
 ### Task 4: Internal helpers and error codes
 
 **Files:**
-- Create: `supabase/migrations/0004_helpers.sql`, `supabase/tests/04_helpers.test.sql`
+- Create: `supabase/migrations/0005_helpers.sql`, `supabase/tests/04_helpers.test.sql`
 
 **Interfaces:**
 - Produces, all in schema `app`. Only the three marked **(RLS)** are granted to `authenticated`; nothing is granted to `anon`.
@@ -292,7 +312,7 @@ select * from finish();
 rollback;
 ```
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0004_helpers.sql`**, ending with the three explicit grants. **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0005_helpers.sql`**, ending with the three explicit grants. **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): session, validation, locking and idempotency helpers`.
 
 ---
@@ -300,7 +320,7 @@ rollback;
 ### Task 5: Table grants and row-level security
 
 **Files:**
-- Create: `supabase/migrations/0005_rls.sql`, `supabase/tests/05_rls.test.sql`
+- Create: `supabase/migrations/0006_rls.sql`, `supabase/tests/05_rls.test.sql`
 
 **Interfaces:**
 - Consumes: `app.session_ok()`, `app.my_role()`, `app.my_branch()`.
@@ -346,7 +366,7 @@ select is_empty($$select table_name from information_schema.role_table_grants
   where grantee in ('anon','PUBLIC') and table_schema = 'public'$$, 'anon reads nothing');
 ```
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0005_rls.sql`.** **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0006_rls.sql`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): table grants and row-level security`.
 
 ---
@@ -354,7 +374,7 @@ select is_empty($$select table_name from information_schema.role_table_grants
 ### Task 6: Transfer RPCs
 
 **Files:**
-- Create: `supabase/migrations/0006_rpc_transfers.sql`, `supabase/tests/06_transfers.test.sql`
+- Create: `supabase/migrations/0007_rpc_transfers.sql`, `supabase/tests/06_transfers.test.sql`
 
 **Interfaces:**
 - Consumes: Task 4 helpers.
@@ -408,7 +428,7 @@ Rules beyond spec section 6.2:
 | expired session | `test.expire_session('201')`, receive → `NOT_AUTHENTICATED`, no rows written |
 | ordering inside one transaction | send then receive in the same test transaction → `transfer_in.occurred_at > transfer_out.occurred_at` (proves `clock_timestamp`, not `now()`) |
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0006_rpc_transfers.sql`** with three `grant execute … to authenticated` lines. **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0007_rpc_transfers.sql`** with three `grant execute … to authenticated` lines. **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): transfer send, receive and owner resolution`.
 
 ---
@@ -416,7 +436,7 @@ Rules beyond spec section 6.2:
 ### Task 7: Purchase RPCs
 
 **Files:**
-- Create: `supabase/migrations/0007_rpc_purchases.sql`, `supabase/tests/07_purchases.test.sql`
+- Create: `supabase/migrations/0008_rpc_purchases.sql`, `supabase/tests/07_purchases.test.sql`
 
 **Interfaces:**
 - Produces (each granted to `authenticated`):
@@ -455,7 +475,7 @@ Rules beyond spec section 6.3:
 | correction before a baseline | baseline `BR-01`/`D-001` = 1000 with `effective_at = clock_timestamp()` after the purchase; void → balance stays `1000` |
 | correction after a baseline | purchase after that baseline; edit 3→1 `عبوة` → balance `1750` |
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0007_rpc_purchases.sql`.** **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0008_rpc_purchases.sql`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): purchase create, owner edit and void`.
 
 ---
@@ -465,7 +485,7 @@ Rules beyond spec section 6.3:
 > **Blocked: pending owner confirmation of the physical counting procedure** (spec section 6.4). Do not start Task 8 or Task 9 until the owner confirms. Tasks 1–7 and 10–12 do not depend on it.
 
 **Files:**
-- Create: `supabase/migrations/0008_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
+- Create: `supabase/migrations/0009_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
 
 **Interfaces:**
 - Produces (each granted to `authenticated`):
@@ -520,7 +540,7 @@ Rules:
 ### Task 9: Count submit, review, baselines, zeroing
 
 **Files:**
-- Modify: `supabase/migrations/0008_rpc_counts.sql` (append; not merged until this task is done)
+- Modify: `supabase/migrations/0009_rpc_counts.sql` (append; not merged until this task is done)
 - Create: `supabase/tests/09_count_review.test.sql`
 
 **Interfaces:**
@@ -569,7 +589,7 @@ Rules:
 ### Task 10: User administration, session revocation, logout
 
 **Files:**
-- Create: `supabase/migrations/0009_rpc_users.sql`, `supabase/tests/09b_users.test.sql`
+- Create: `supabase/migrations/0010_rpc_users.sql`, `supabase/tests/09b_users.test.sql`
 
 **Interfaces:**
 - Produces (each granted to `authenticated`; all but `logout` are owner only):
@@ -612,7 +632,7 @@ Rules:
 | secret not leaked | no `rpc_requests` row (`result::text`, `request_hash`, `secret_verifier`) or `activity_log.details::text` contains `4444` |
 | feature toggle | hide `purchase` for `BR-01` → `create_purchase` by `201` raises `FEATURE_HIDDEN` |
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0009_rpc_users.sql`.** **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0010_rpc_users.sql`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): user administration, per-session revocation, logout`.
 
 ---
@@ -620,7 +640,7 @@ Rules:
 ### Task 11: Login verification in the database
 
 **Files:**
-- Create: `supabase/migrations/0010_login.sql`, `supabase/tests/10_login.test.sql`
+- Create: `supabase/migrations/0011_login.sql`, `supabase/tests/10_login.test.sql`
 
 **Interfaces:**
 - Produces (in `public`, each granted to `service_role` **only**):
@@ -657,7 +677,7 @@ Rules:
 | not callable by clients | `test.act_as('201')`; each of the three functions → `42501` |
 | server role keeps execute | `has_function_privilege('service_role', …, 'execute')` is true for each of the three functions, and one of them is actually called after `test.act_as_service()` (deferred from Task 1 by the owner: first server-only functions) |
 
-- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0010_login.sql`.** **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0011_login.sql`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): login verification, lockout, session registration`.
 
 ---
@@ -734,7 +754,8 @@ Deno.test("sessionIdFromJwt reads the claim and rejects a token without it", () 
 ### Task 13: Concurrency tests on two real connections
 
 **Files:**
-- Create: `supabase/tests-concurrency/helpers.ts`, `supabase/tests-concurrency/concurrency_test.ts`
+- Create: `supabase/tests-concurrency/concurrency_test.ts`
+- Modify: `supabase/tests-concurrency/helpers.ts` (created in Task 3 with `connect()`; add the rest here)
 - Modify: `.github/workflows/test.yml` (run after `supabase db reset`: `deno test --allow-net=127.0.0.1:54322 --allow-env supabase/tests-concurrency/`)
 
 **Interfaces:**
