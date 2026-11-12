@@ -1,5 +1,5 @@
 begin;
-select plan(72);  -- the brief's 29 assertions plus additions; never drop one
+select plan(86);  -- the brief's 29 assertions plus additions; never drop one
 -- client-visible
 select test.act_as('201');
 select is(app.session_ok(), true); select is(app.my_branch(), 'BR-01'); select is(app.my_role(), 'manager');
@@ -73,8 +73,14 @@ select throws_ok($$select app.require_role('manager')$$, 'P0001', 'NOT_AUTHENTIC
 select lives_ok($$select app.require_feature('BR-01','send')$$, 'visible feature passes');
 
 -- lock_branches
+create temp table lock_count(n bigint) on commit drop;
+insert into lock_count select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid();
 select ok(app.lock_branches('BR-02','BR-01','BR-02') is not null, 'duplicates and unsorted ids are accepted');
+select is((select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()) - (select n from lock_count),
+          2::bigint, 'two distinct branches: exactly two advisory locks');
 select ok(app.lock_branches(variadic '{}'::text[]) is not null and app.lock_branches(variadic null::text[]) is not null, 'empty or null list returns a timestamp');
+select is((select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()) - (select n from lock_count),
+          2::bigint, 'empty or null list adds no lock');
 select ok(app.lock_branches('BR-01') > now(), 'returns clock_timestamp, later than the transaction start');
 
 -- require_not_frozen
@@ -114,6 +120,34 @@ select is((select user_id from activity_log where action='test_action'), (select
 -- normalize_digits
 select is(app.normalize_digits('۰۱۲۳۴۵۶۷۸۹ ٠١٢٣٤٥٦٧٨٩ ab'), '0123456789 0123456789 ab', 'both digit sets');
 select is(app.normalize_digits(null), null, 'null passes through');
+
+-- fix round 1 -------------------------------------------------------------
+-- require_role fails closed on null role lists
+select set_config('request.jwt.claims', jsonb_build_object(
+  'sub', (select auth_user_id from app_users where employee_number='100'),
+  'session_id', (select session_id from app_sessions where user_id = (select id from app_users where employee_number='100')))::text, true);
+select is((app.require_role('owner','manager')).employee_number, '100', 'owner passes require_role');
+select throws_ok($$select app.require_role('manager', null)$$, 'P0001', 'FORBIDDEN', 'null inside the role list does not let the owner through');
+select throws_ok($$select app.require_role(variadic null::text[])$$, 'P0001', 'FORBIDDEN', 'null role list is refused');
+-- malformed claims
+select set_config('request.jwt.claims', jsonb_build_object('sub', 'x',
+  'session_id', (select session_id from app_sessions where user_id = (select id from app_users where employee_number='203')))::text, true);
+select is(app.session_ok(), false, 'malformed sub: false');
+select throws_ok('select app.current_app_user()', 'P0001', 'NOT_AUTHENTICATED', 'malformed sub');
+select set_config('request.jwt.claims', '{not json', true);
+select is(app.session_ok(), false, 'claims not valid JSON: false');
+select throws_ok('select app.current_app_user()', 'P0001', 'NOT_AUTHENTICATED', 'claims not valid JSON');
+select set_config('request.jwt.claims', jsonb_build_object(
+  'session_id', (select session_id from app_sessions where user_id = (select id from app_users where employee_number='203')))::text, true);
+select is(app.session_ok(), false, 'session_id without sub: false');
+select throws_ok('select app.current_app_user()', 'P0001', 'NOT_AUTHENTICATED', 'session_id without sub');
+select set_config('request.jwt.claims', '', true);
+-- unit_rate: unknown unit stays invalid even when inactive is allowed
+select throws_ok($$select app.unit_rate('D-001','xx', true)$$, 'P0001', 'UNIT_INVALID', 'missing unit invalid with p_allow_inactive');
+-- clients cannot create objects in public (so nothing can shadow an unqualified name)
+select ok(not has_schema_privilege('authenticated', 'public', 'create'), 'authenticated cannot create in public');
+select ok(not has_schema_privilege('anon', 'public', 'create'), 'anon cannot create in public');
+
 
 -- privileges: only the three RLS helpers are executable by clients
 select is((select coalesce(array_agg(p.proname::text order by p.proname), '{}')

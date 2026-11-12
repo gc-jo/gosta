@@ -19,7 +19,7 @@ begin
   begin
     v_uid   := auth.uid();
     v_claim := auth.jwt() ->> 'session_id';
-  exception when invalid_text_representation then
+  exception when data_exception then  -- class 22: 22P02 bad uuid/JSON text, and any sibling
     raise exception 'NOT_AUTHENTICATED';
   end;
   if v_uid is null or v_claim is null
@@ -85,7 +85,8 @@ set search_path = app, public, extensions, pg_temp as $$
 declare
   v_user app_users := app.current_app_user();
 begin
-  if v_user.role is null or not (v_user.role = any (p_roles)) then
+  -- fail closed: a null role list, or a null inside it, must not let anyone through
+  if not coalesce(v_user.role = any (p_roles), false) then
     raise exception 'FORBIDDEN';
   end if;
   return v_user;
@@ -107,6 +108,8 @@ $$;
 
 -- Contract: takes one transaction-level advisory lock per distinct branch id, in ascending
 -- order, then returns clock_timestamp(). An empty or null list locks nothing. Raises nothing.
+-- Needs at least one argument unless called as lock_branches(variadic <array>). A transaction must
+-- lock ALL its branches in ONE call: two calls can invert the order and deadlock.
 create function app.lock_branches(variadic p_branch_ids text[]) returns timestamptz
 language plpgsql security definer
 set search_path = app, public, extensions, pg_temp as $$
@@ -195,7 +198,7 @@ language plpgsql security definer
 set search_path = app, public, extensions, pg_temp as $$
 declare
   v_row  rpc_requests;
-  v_hash text := encode(digest(p_rpc_name || ':' || p_params::text, 'sha256'), 'hex');
+  v_hash text := encode(extensions.digest(p_rpc_name || ':' || p_params::text, 'sha256'), 'hex');
 begin
   perform pg_advisory_xact_lock(hashtextextended('req:' || p_request_id, 0));
   select r.* into v_row from rpc_requests r where r.request_id = p_request_id;
@@ -220,8 +223,8 @@ set search_path = app, public, extensions, pg_temp as $$
 begin
   insert into rpc_requests (request_id, rpc_name, user_id, request_hash, secret_verifier, result)
   values (p_request_id, p_rpc_name, p_user_id,
-          encode(digest(p_rpc_name || ':' || p_params::text, 'sha256'), 'hex'),
-          case when p_secret is null then null else crypt(p_secret, gen_salt('bf', 10)) end,
+          encode(extensions.digest(p_rpc_name || ':' || p_params::text, 'sha256'), 'hex'),
+          case when p_secret is null then null else extensions.crypt(p_secret, extensions.gen_salt('bf', 10)) end,
           p_result);
   return p_result;
 end;
@@ -233,7 +236,7 @@ create function app.request_secret_ok(p_request_id uuid, p_secret text) returns 
 language sql stable security definer
 set search_path = app, public, extensions, pg_temp as $$
   select coalesce(
-    (select crypt(p_secret, r.secret_verifier) = r.secret_verifier
+    (select extensions.crypt(p_secret, r.secret_verifier) = r.secret_verifier
      from rpc_requests r where r.request_id = p_request_id and r.secret_verifier is not null),
     false)
 $$;
