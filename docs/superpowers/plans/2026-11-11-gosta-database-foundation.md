@@ -70,6 +70,7 @@ supabase/
                                       discard_count, submit_count, review_count, zero_branch_balance
     0010_rpc_users.sql                admin_* user RPCs, set_branch_feature, logout
     0011_login.sql                    login_verify, login_attach_auth_user, login_register_session
+    0012_owner_session_recheck.sql    follow-up to 0010: admin_set_secret rechecks the caller's session after the row lock
   functions/login/
     index.ts, derive.ts, derive_test.ts, login_integration_test.ts
   tests/                              pgTAP, one file per migration, plus 20_reconciliation
@@ -665,7 +666,8 @@ Rules:
 ### Task 11: Login verification in the database
 
 **Files:**
-- Create: `supabase/migrations/0011_login.sql`, `supabase/tests/10_login.test.sql`
+- Create: `supabase/migrations/0011_login.sql`, `supabase/migrations/0012_owner_session_recheck.sql`, `supabase/tests/10_login.test.sql`, `supabase/tests-concurrency/owner_password_test.ts`
+- Modify: `supabase/tests-concurrency/helpers.ts` (add what the new two-connection test needs)
 
 **Interfaces:**
 - Produces (in `public`, each granted to `service_role` **only**):
@@ -699,11 +701,18 @@ Rules:
 | attach repairs | create user `206` (no Auth user); insert an `auth.users` row with email `206@gosta.invalid`; `login_verify('206', pin)` → `auth_user_id` equals that row's id |
 | attach is stable | `login_attach_auth_user` twice → same id; a second `auth.users` row cannot be attached to an already attached user |
 | register session | `login_register_session(user, gen_random_uuid(), <version from login_verify>)` → one row expiring ≈ +7 days; for inactive `299` → `USER_INVALID` |
+| **missing credential version** | `login_register_session(user, gen_random_uuid(), null)` → `USER_INVALID`, no session row; null user id and null session id → `USER_INVALID`; a version one lower and one higher than the current one → `USER_INVALID` |
+| leading zeros | create users `0204` and `204` with different PINs; each logs in only with its own number and PIN; `login_verify('204', <PIN of 0204>)` → `invalid` |
 | **login in flight during a reset** | `login_verify('201','1111')` → version v; as owner `admin_set_secret('201', '7777')`; as service `login_register_session(user, new id, v)` → `USER_INVALID`; `201` has no unrevoked session |
 | login in flight during a deactivation | same with `admin_set_user_active(false)` → `USER_INVALID` |
 | not callable by clients | `test.act_as('201')`; each of the three functions → `42501` |
 | server role keeps execute | `has_function_privilege('service_role', …, 'execute')` is true for each of the three functions, and one of them is actually called after `test.act_as_service()` (deferred from Task 1 by the owner: first server-only functions) |
 
+- **Owner additions (2026-11-12).**
+  - **Missing credential version.** `login_register_session` raises `USER_INVALID` when `p_credential_version` is null (a null would otherwise compare as "unknown" and slip past a `<>` test), and likewise for a null `p_user_id` or `p_session_id`. Tested next to the stale-version cases.
+  - **Leading zeros are kept.** Employee numbers are compared as text after digit normalisation only: `0204` and `204` are different users, at login exactly as at creation (Task 10 decision, unchanged).
+  - **Follow-up migration `0012_owner_session_recheck.sql`.** As accepted in 0010, `admin_set_secret` checks the caller's session before it waits for the target row lock. When the owner changes their own password from session S2, S2 revokes the owner's other session S1 under that lock; a request from S1 that was already waiting then went on to change the password although S1 had just been revoked. 0012 re-creates `public.admin_set_secret` (same signature, attributes, grants and behaviour; 0010 is not edited) with one addition: immediately after the `select … for update` on the target row it calls `app.current_app_user()` again, so a caller whose session was revoked while it waited is refused with `NOT_AUTHENTICATED` and nothing is written. For a self-change the row locked is the caller's own row, which is exactly the lock a concurrent revocation holds, so the recheck is exact; for other targets it is a best-effort second look.
+  - **Two-connection regression `owner_password_test.ts`:** owner with two live sessions S1 and S2 (the second inserted and committed by the test, removed afterwards). A (as S2): `begin`, `admin_set_secret(own id, P2)`, not yet committed. B (as S1): `begin`, `admin_set_secret(own id, P3)` → shown to be waiting on a lock. A commits. Assert: B fails with `NOT_AUTHENTICATED`; the stored hash matches P2 and not P3; `credential_version` rose by exactly 1; S1 is revoked and S2 is not. The test restores the owner's original hash, version and sessions before it ends, so later suites can still log the owner in. RED is shown against the database without 0012: B succeeds and the password is P3.
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0011_login.sql`.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): login verification, lockout, session registration`.
 
