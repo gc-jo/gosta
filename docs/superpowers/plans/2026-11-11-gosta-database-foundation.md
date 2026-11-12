@@ -448,6 +448,8 @@ Rules beyond spec section 6.2:
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write `0007_rpc_transfers.sql`** with three `grant execute … to authenticated` lines. **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): transfer send, receive and owner resolution`.
 
+> **Follow-up recorded after acceptance (transfer overflow).** As accepted, `send_transfer` and `app.receive_transfer_line` in `0007` multiply quantity × rate with no guard, so an absurd quantity (for example `1e131070`) surfaced as SQLSTATE 22003 instead of `QUANTITY_INVALID`; the transaction aborted and nothing was written. `0007` is frozen and was not edited. The gap is closed in `0008_rpc_purchases.sql`, which re-creates `app.check_quantity` and `app.check_cost` with a ceiling of 10^12 (rule (m)); every quantity in the transfer RPCs already passes through `check_quantity`, so the product can no longer overflow. Regression tests live in `07_purchases.test.sql` (`send_transfer` with `1e131070` and `1e13`, `receive_transfer` with `1e13` → `QUANTITY_INVALID`, nothing written). Remaining for Task 13: include one oversized-quantity case in the two-connection suite so the bound is also exercised outside a single test transaction. If the ceiling ever has to change, change it in a new migration by re-creating the two helpers, never by editing 0005 or 0008.
+
 ---
 
 ### Task 7: Purchase RPCs
@@ -625,7 +627,9 @@ Rules:
 
 - The secret is never part of `p_params`, `rpc_requests.result` or `activity_log.details`.
 - **Replay with a secret.** `admin_create_user` and `admin_set_secret` pass the cleaned secret to `request_store`, which keeps a verifier on the request row itself. When `request_replay` returns a stored result, the RPC returns it only if `app.request_secret_ok(p_request_id, clean_secret)`, else `REQUEST_ID_REUSED`. The comparison is against the original request, not the user's current hash, so a later PIN change cannot alter the answer. A replay never changes the stored PIN.
-- `admin_create_user`: employee number normalised with `normalize_digits`; duplicate → `EMPLOYEE_NUMBER_TAKEN`; role/branch mismatch or unknown branch → `USER_INVALID`. `auth_user_id` stays null until first login.
+- `admin_create_user`: employee number normalised with `normalize_digits`; duplicate → `EMPLOYEE_NUMBER_TAKEN`; role/branch mismatch or unknown branch → `USER_INVALID`. `auth_user_id` stays null until first login. **Role `owner` is refused (`USER_INVALID`)**: owner accounts are not created through the app (the spec has one owner, provisioned at set-up), which also means `admin_set_secret` and `admin_set_user_active` can only ever meet an owner row that is the caller's own.
+- `set_branch_feature`: unknown or inactive branch → `BRANCH_INVALID`; a feature key outside the five allowed → `FEATURE_INVALID` (new code); upserts the row.
+- **Migration numbering.** This task keeps its assigned number, `0010_rpc_users.sql`, although `0009_rpc_counts.sql` (Tasks 8–9, paused) does not exist yet. A fresh database applies files in filename order, so adding 0009 later is fine locally and in CI. On a hosted project that has already had 0010 applied, an earlier-numbered file is refused by default; nothing is hosted yet, and plan 2's first task (applying migrations to `gosta-test`) must not start until 0009 exists or must apply with the out-of-order flag deliberately.
 - `admin_set_secret` and `admin_set_user_active(false)` call `app.revoke_sessions` and set `credential_version = credential_version + 1`, both under the user-row lock. `admin_set_secret` also zeroes `failed_attempts` and `locked_until`. Row-lock the `app_users` row first.
 - `admin_set_user_active(false)` on the caller's own row → `USER_INVALID`.
 - `admin_set_secret` on an owner row is allowed only for the caller's own row; it revokes the owner's other sessions but not the calling one.
