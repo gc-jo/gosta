@@ -6,6 +6,20 @@
 -- -> row lock on the target -> validate against state -> write -> log_action -> request_store.
 -- A secret is hashed only as crypt(clean_secret(...), gen_salt('bf', 10)) and only after clean_secret passed.
 
+-- Hardening of 0005 helper (follow-up; 0005 itself is not edited).
+-- Same signature, attributes and behaviour as in 0005, plus one rule: a secret longer than 72 bytes never
+-- matches. bcrypt reads only the first 72 bytes, so the stored verifier alone would accept a 73-byte string
+-- whose first 72 bytes equal the original. RPCs also call clean_secret first; this is the second guard.
+-- create or replace keeps the existing (closed) privileges.
+create or replace function app.request_secret_ok(p_request_id uuid, p_secret text) returns boolean
+language sql stable security definer
+set search_path = app, public, extensions, pg_temp as $$
+  select coalesce(
+    (select octet_length(p_secret) <= 72 and extensions.crypt(p_secret, r.secret_verifier) = r.secret_verifier
+     from rpc_requests r where r.request_id = p_request_id and r.secret_verifier is not null),
+    false)
+$$;
+
 -- Contract: returns the secret in the form that is hashed. Raises SECRET_WEAK / SECRET_TOO_LONG / USER_INVALID.
 -- Order: null -> SECRET_WEAK. owner: octet_length > 72 -> SECRET_TOO_LONG (bytes, checked first: bcrypt silently
 -- reads only the first 72 bytes), then char_length < 12 -> SECRET_WEAK; returned exactly as given (no
@@ -64,6 +78,7 @@ declare
   v_owner  app_users := app.require_role('owner');
   v_number text;
   v_name   text;
+  v_branch text;
   v_clean  text;
   v_params jsonb;
   v_replay jsonb;
@@ -75,12 +90,13 @@ begin
   end if;
   v_number := nullif(btrim(app.normalize_digits(p_employee_number)), '');
   v_name   := nullif(btrim(p_name), '');
+  v_branch := nullif(btrim(p_branch_id), '');
   if v_number is null or v_number !~ '^[0-9]+$' or v_name is null
-     or p_role is null or p_role not in ('manager', 'distributor') or p_branch_id is null then
+     or p_role is null or p_role not in ('manager', 'distributor') or v_branch is null then
     raise exception 'USER_INVALID';
   end if;
   v_clean  := app.clean_secret(p_role, p_secret);
-  v_params := jsonb_build_object('employee_number', v_number, 'name', v_name, 'role', p_role, 'branch_id', p_branch_id);
+  v_params := jsonb_build_object('employee_number', v_number, 'name', v_name, 'role', p_role, 'branch_id', v_branch);
 
   v_replay := app.request_replay(p_request_id, 'admin_create_user', v_owner.id, v_params);
   if v_replay is not null then
@@ -90,11 +106,11 @@ begin
     raise exception 'REQUEST_ID_REUSED';
   end if;
 
-  if not exists (select 1 from branches b where b.id = p_branch_id and b.active) then
+  if not exists (select 1 from branches b where b.id = v_branch and b.active) then
     raise exception 'USER_INVALID';
   end if;
   insert into app_users (employee_number, name, role, branch_id)
-  values (v_number, v_name, p_role, p_branch_id)
+  values (v_number, v_name, p_role, v_branch)
   on conflict (employee_number) do nothing
   returning id into v_id;
   if v_id is null then
@@ -105,7 +121,7 @@ begin
 
   v_result := jsonb_build_object('user_id', v_id);
   perform app.log_action(v_owner.id, 'admin_create_user', 'app_users', v_id::text,
-                         jsonb_build_object('employee_number', v_number, 'role', p_role, 'branch_id', p_branch_id));
+                         jsonb_build_object('employee_number', v_number, 'role', p_role, 'branch_id', v_branch));
   return app.request_store(p_request_id, 'admin_create_user', v_owner.id, v_params, v_result, v_clean);
 end;
 $$;
@@ -114,6 +130,8 @@ $$;
 -- First call: new hash, failed_attempts 0, locked_until null, credential_version + 1, sessions of the target
 -- revoked (the calling session excepted when the owner changes their own password). Replay: nothing.
 -- An owner row other than the caller's own is refused (FORBIDDEN).
+-- Resetting to the value the user already has is still a real change (version + 1, sessions revoked):
+-- a reset is the owner's revoke-everything action.
 create function public.admin_set_secret(p_request_id uuid, p_user_id uuid, p_secret text) returns jsonb
 language plpgsql security definer
 set search_path = app, public, extensions, pg_temp as $$
@@ -220,7 +238,7 @@ end;
 $$;
 
 -- admin_unlock_user -----------------------------------------------------------------------------------
--- failed_attempts 0, locked_until null. No version or session change.
+-- failed_attempts 0, locked_until null. No version or session change. Another owner's row -> FORBIDDEN.
 create function public.admin_unlock_user(p_request_id uuid, p_user_id uuid) returns jsonb
 language plpgsql security definer
 set search_path = app, public, extensions, pg_temp as $$
@@ -247,6 +265,9 @@ begin
   select u.* into v_target from app_users u where u.id = p_user_id for update;
   if v_target.id is null then
     raise exception 'USER_INVALID';
+  end if;
+  if v_target.role = 'owner' and v_target.id <> v_owner.id then
+    raise exception 'FORBIDDEN';
   end if;
   update app_users set failed_attempts = 0, locked_until = null where id = p_user_id;
 

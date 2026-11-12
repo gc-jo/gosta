@@ -1,5 +1,5 @@
 begin;
-select plan(235);
+select plan(268);
 
 -- test-local helpers (rolled back with the transaction) ----------------------------------
 create schema t10;
@@ -129,6 +129,15 @@ select ok((select extensions.crypt(repeat('x', 73), h) = h from (select extensio
 select ok((select extensions.crypt(repeat('x', 71), h) <> h from (select extensions.crypt(repeat('x', 72), extensions.gen_salt('bf', 10)) as h) q),
   'but byte 72 does count: 71 bytes do not match');
 
+select lives_ok($$select app.request_store('f1000000-0000-4000-8000-000000000099', 'probe', t10.uid('100'), '{}'::jsonb, '{}'::jsonb, repeat('x', 72))$$, 'probe request stored with a 72-byte secret');
+select ok(app.request_secret_ok('f1000000-0000-4000-8000-000000000099', repeat('x', 72)), 'request_secret_ok: the stored 72-byte secret matches');
+select ok(not app.request_secret_ok('f1000000-0000-4000-8000-000000000099', repeat('x', 72) || 'z'), 'request_secret_ok: 72 bytes plus one is false although bcrypt would truncate');
+select ok(not app.request_secret_ok('f1000000-0000-4000-8000-000000000099', repeat('x', 73)), 'request_secret_ok: 73 bytes is false');
+select ok(not app.request_secret_ok('f1000000-0000-4000-8000-000000000099', null), 'request_secret_ok: null is false');
+select ok(not has_function_privilege('authenticated', 'app.request_secret_ok(uuid,text)', 'execute')
+      and not has_function_privilege('anon', 'app.request_secret_ok(uuid,text)', 'execute'), 'request_secret_ok is still closed to clients');
+delete from rpc_requests where request_id = 'f1000000-0000-4000-8000-000000000099';
+
 -- 2. privileges, role gate, request id -----------------------------------------------------------
 select ok(has_function_privilege('authenticated', 'public.admin_create_user(uuid,text,text,text,text,text)', 'execute')
       and has_function_privilege('authenticated', 'public.admin_set_secret(uuid,uuid,text)', 'execute')
@@ -166,6 +175,7 @@ select is(t10.world(), t10.snapv('w0'), 'role refusals and missing request ids w
 select test.act_as('100');
 select lives_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000101', '204', 'مدير 4', 'manager', 'BR-02', '4444')$$, 'owner creates 204 manager BR-02');
 select lives_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000102', '205', '  مدير 5  ', 'manager', 'BR-01', '٥٥٥٥')$$, 'owner creates 205 with an Arabic-digit PIN');
+select lives_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000104', '208', 'موزع 8', 'distributor', ' BR-14 ', '8080')$$, 'owner creates a user with a padded branch id');
 select lives_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000103', '٢٠٦', 'موزع 6', 'distributor', 'BR-14', '6666')$$, 'owner creates a distributor with an Arabic-digit employee number');
 select test.reset_role();
 select is((select concat_ws('|', role, branch_id, active, auth_user_id is null, credential_version, failed_attempts, name)
@@ -174,6 +184,7 @@ select ok(t10.hash('204') is not null and t10.hash('204') <> '4444' and t10.hm('
 select is(t10.stored('f1000000-0000-4000-8000-000000000101'), jsonb_build_object('user_id', t10.uid('204')), 'stored result is exactly {user_id}');
 select is((select concat_ws('|', rpc_name, user_id = t10.uid('100'), secret_verifier is not null) from rpc_requests where request_id = 'f1000000-0000-4000-8000-000000000101'), 'admin_create_user|t|t', 'request row: rpc, owner, verifier present');
 select is((select count(*) from activity_log where action = 'admin_create_user' and user_id = t10.uid('100') and entity_table = 'app_users' and entity_id = t10.uid('204')::text), 1::bigint, 'activity logged once');
+select is((select branch_id from app_users where employee_number = '208'), 'BR-14', 'padded branch id is stored trimmed');
 select ok(t10.hm('205', '5555') and not t10.hm('205', '٥٥٥٥'), 'Arabic-digit PIN is stored in its ASCII form');
 select is((select name from app_users where employee_number = '205'), 'مدير 5', 'name is trimmed');
 select is((select concat_ws('|', employee_number, role, branch_id) from app_users where id = (t10.stored('f1000000-0000-4000-8000-000000000103') ->> 'user_id')::uuid), '206|distributor|BR-14', 'Arabic-digit employee number stored as ASCII');
@@ -204,8 +215,12 @@ select is(t10.world(), t10.snapv('w3'), 'no refused create stored a user, secret
 
 -- replay of a create
 select test.act_as('100');
-select is(public.admin_create_user('f1000000-0000-4000-8000-000000000101', '204', 'مدير 4', 'manager', 'BR-02', '4444'), t10.stored('f1000000-0000-4000-8000-000000000101'), 'replay (same id, same values) returns the stored result');
-select is(public.admin_create_user('f1000000-0000-4000-8000-000000000102', '205', 'مدير 5', 'manager', 'BR-01', '5555'), t10.stored('f1000000-0000-4000-8000-000000000102'), 'replay with ASCII digits and an untrimmed name is the same request');
+select lives_ok($$select t10.snap('ret1', (public.admin_create_user('f1000000-0000-4000-8000-000000000101', '204', 'مدير 4', 'manager', 'BR-02', '4444'))::text)$$, 'replay (same id, same values) returns the stored result: call succeeds');
+select is(t10.snapv('ret1'), t10.stored('f1000000-0000-4000-8000-000000000101')::text, 'replay (same id, same values) returns the stored result');
+select lives_ok($$select t10.snap('ret2', (public.admin_create_user('f1000000-0000-4000-8000-000000000102', '205', 'مدير 5', 'manager', 'BR-01', '5555'))::text)$$, 'replay with ASCII digits and an untrimmed name is the same request: call succeeds');
+select is(t10.snapv('ret2'), t10.stored('f1000000-0000-4000-8000-000000000102')::text, 'replay with ASCII digits and an untrimmed name is the same request');
+select lives_ok($$select t10.snap('retb', (public.admin_create_user('f1000000-0000-4000-8000-000000000104', '208', 'موزع 8', 'distributor', 'BR-14', '8080'))::text)$$, 'replay with the trimmed branch: call succeeds');
+select is(t10.snapv('retb'), t10.stored('f1000000-0000-4000-8000-000000000104')::text, 'a padded and a trimmed branch id are the same request');
 select throws_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000101', '204', 'مدير 4', 'manager', 'BR-02', '4445')$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other PIN');
 select throws_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000101', '204', 'اسم آخر', 'manager', 'BR-02', '4444')$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other name');
 select throws_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000101', '204', 'مدير 4', 'manager', 'BR-01', '4444')$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other branch');
@@ -242,7 +257,8 @@ select throws_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000
 select throws_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000000000411', 'BR-01', '', false)$$, 'P0001', 'FEATURE_INVALID', 'blank feature');
 select throws_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000000000411', 'BR-01', 'Purchase', false)$$, 'P0001', 'FEATURE_INVALID', 'wrong case');
 select throws_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000000000411', 'BR-01', 'purchase', null)$$, 'P0001', 'FEATURE_INVALID', 'null visible');
-select is(public.set_branch_feature('f1000000-0000-4000-8000-000000000402', 'BR-01', 'purchase', true), t10.stored('f1000000-0000-4000-8000-000000000402'), 'replay returns the stored result');
+select lives_ok($$select t10.snap('ret3', (public.set_branch_feature('f1000000-0000-4000-8000-000000000402', 'BR-01', 'purchase', true))::text)$$, 'replay returns the stored result: call succeeds');
+select is(t10.snapv('ret3'), t10.stored('f1000000-0000-4000-8000-000000000402')::text, 'replay returns the stored result');
 select throws_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000000000402', 'BR-01', 'purchase', false)$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other value');
 select throws_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000000000402', 'BR-01', 'send', true)$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other feature');
 select lives_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-000000000412', 'BR-01', 'send', false)$$, 'toggle send off');
@@ -250,7 +266,8 @@ select lives_ok($$select public.set_branch_feature('f1000000-0000-4000-8000-0000
 select test.reset_role();
 select t10.snap('w4b', t10.world());
 select test.act_as('100');
-select is(public.set_branch_feature('f1000000-0000-4000-8000-000000000412', 'BR-01', 'send', false), t10.stored('f1000000-0000-4000-8000-000000000412'), 'replay of an older toggle returns its stored result');
+select lives_ok($$select t10.snap('ret4', (public.set_branch_feature('f1000000-0000-4000-8000-000000000412', 'BR-01', 'send', false))::text)$$, 'replay of an older toggle returns its stored result: call succeeds');
+select is(t10.snapv('ret4'), t10.stored('f1000000-0000-4000-8000-000000000412')::text, 'replay of an older toggle returns its stored result');
 select test.reset_role();
 select is(t10.world(), t10.snapv('w4b'), 'the replay did not re-apply the old toggle');
 select is((select visible from branch_features where branch_id = 'BR-01' and feature_key = 'send'), true, 'send is still visible');
@@ -294,8 +311,10 @@ select test.reset_role();
 select t10.snap('w5b', t10.world());
 select t10.snap('h201', t10.hash('201'));
 select test.act_as('100');
-select is(public.admin_set_secret('f1000000-0000-4000-8000-000000000502', t10.uid('201'), '8888'), t10.stored('f1000000-0000-4000-8000-000000000502'), 'replay returns the same result');
-select is(public.admin_set_secret('f1000000-0000-4000-8000-000000000502', t10.uid('201'), '٨٨٨٨'), t10.stored('f1000000-0000-4000-8000-000000000502'), 'replay with Arabic digits is the same secret');
+select lives_ok($$select t10.snap('ret5', (public.admin_set_secret('f1000000-0000-4000-8000-000000000502', t10.uid('201'), '8888'))::text)$$, 'replay returns the same result: call succeeds');
+select is(t10.snapv('ret5'), t10.stored('f1000000-0000-4000-8000-000000000502')::text, 'replay returns the same result');
+select lives_ok($$select t10.snap('ret6', (public.admin_set_secret('f1000000-0000-4000-8000-000000000502', t10.uid('201'), '٨٨٨٨'))::text)$$, 'replay with Arabic digits is the same secret: call succeeds');
+select is(t10.snapv('ret6'), t10.stored('f1000000-0000-4000-8000-000000000502')::text, 'replay with Arabic digits is the same secret');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000502', t10.uid('201'), '9999')$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other PIN');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000502', t10.uid('202'), '8888')$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other user');
 select test.reset_role();
@@ -304,9 +323,16 @@ select is(t10.hash('201'), t10.snapv('h201'), 'stored hash is byte-identical');
 select ok(t10.hm('201', '8888') and not t10.hm('201', '9999'), 'stored PIN is still the first one');
 select is(t10.is_revoked('5e5e5e5e-0000-4000-8000-0000000002a1'), false, 'the new session was not revoked by the replay');
 
+-- resetting to the value the user already has is a real reset: version +1, sessions revoked
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000503', t10.uid('201'), '8888')$$, 'owner resets 201 to the PIN it already has');
+select test.reset_role();
+select is(t10.cv('201'), 2, 'same-value reset still bumps the version');
+select is(t10.is_revoked('5e5e5e5e-0000-4000-8000-0000000002a1'), true, 'and revokes the session created meanwhile');
+
 -- 6. owner changes own password: calling session survives ------------------------------------------
 select t10.new_session('100', '5e5e5e5e-0000-4000-8000-0000000001a2');
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000601', t10.uid('100'), 'canary-pass-9137-zq')$$, 'owner sets own password');
 select ok(app.session_ok(), 'the calling session still works');
 select lives_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000602', t10.uid('202'), true)$$, 'and can still call RPCs');
@@ -317,14 +343,23 @@ select is(t10.is_revoked('5e5e5e5e-0000-4000-8000-0000000001a2'), true, 'the own
 select ok(t10.hm('100', 'canary-pass-9137-zq') and not t10.hm('100', 'correct horse battery'), 'owner hash replaced');
 
 -- 7. bcrypt boundary through admin_set_secret on the owner's own row ----------------------------------
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000701', t10.uid('100'), repeat('x', 72))$$, '72 ASCII bytes accepted');
 select test.reset_role();
 select ok(t10.hm('100', repeat('x', 72)), 'stored hash matches the 72-byte password');
 select ok(not t10.hm('100', repeat('x', 71) || 'y'), 'and not the same string with the last (72nd) character changed: all 72 bytes count');
 select is(t10.cv('100'), 2, 'version +1 for the accepted 72-byte password');
+select t10.snap('w7a', t10.world());
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000701', t10.uid('100'), repeat('x', 73))$$, 'P0001', 'SECRET_TOO_LONG', 'replay path: 73 bytes with the same 72-byte prefix is too long');
+select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000701', t10.uid('100'), repeat('x', 72) || 'y')$$, 'P0001', 'SECRET_TOO_LONG', 'replay path: 72 bytes plus y is too long');
+select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000701', t10.uid('100'), repeat('x', 71) || 'y')$$, 'P0001', 'REQUEST_ID_REUSED', 'replay path: 72 bytes differing in the last character is a different secret');
+select lives_ok($$select t10.snap('ret701', (public.admin_set_secret('f1000000-0000-4000-8000-000000000701', t10.uid('100'), repeat('x', 72)))::text)$$, 'replay path: the identical 72 bytes: call succeeds');
+select is(t10.snapv('ret701'), t10.stored('f1000000-0000-4000-8000-000000000701')::text, 'replay path: the identical 72 bytes return the stored result');
+select test.reset_role();
+select is(t10.world(), t10.snapv('w7a'), 'replay path: nothing changed after the four calls');
 select t10.snap('w7', t10.world());
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000702', t10.uid('100'), repeat('x', 73))$$, 'P0001', 'SECRET_TOO_LONG', '73 ASCII bytes refused');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000702', t10.uid('100'), repeat('ب', 37))$$, 'P0001', 'SECRET_TOO_LONG', '37 Arabic letters (74 bytes) refused');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000702', t10.uid('100'), 'short')$$, 'P0001', 'SECRET_WEAK', 'owner: short refused');
@@ -332,14 +367,14 @@ select test.reset_role();
 select is(t10.world(), t10.snapv('w7'), 'refusals stored nothing: hash, version, sessions and request rows unchanged');
 select is(t10.nreq('f1000000-0000-4000-8000-000000000702'), 0::bigint, 'no request row for a refused secret');
 select ok(t10.hm('100', repeat('x', 72)), 'hash still the 72-byte one');
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000703', t10.uid('100'), repeat('ب', 36))$$, '36 Arabic letters (72 bytes) accepted');
 select test.reset_role();
 select ok(t10.hm('100', repeat('ب', 36)) and not t10.hm('100', repeat('ب', 35) || 'ت'), 'all 36 Arabic letters count');
 select is(t10.cv('100'), 3, 'version +1 again');
 
 -- 8. secret replay after a later change (203) -----------------------------------------------------------
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '1111')$$, 'A sets 203 to 1111');
 select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000802', t10.uid('203'), '2222')$$, 'B sets 203 to 2222');
 select test.reset_role();
@@ -347,13 +382,16 @@ select is(t10.cv('203'), 2, 'two real changes, version 2');
 select ok(t10.hm('203', '2222') and not t10.hm('203', '1111'), 'hash matches 2222');
 select t10.snap('w8', t10.world());
 select t10.snap('h203', t10.hash('203'));
-select test.act_as('100');
-select is(public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '1111'), t10.stored('f1000000-0000-4000-8000-000000000801'), 'retry A with 1111 returns A''s stored result');
-select is(public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '١١١١'), t10.stored('f1000000-0000-4000-8000-000000000801'), 'retry A with Arabic digits too');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select lives_ok($$select t10.snap('ret7', (public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '1111'))::text)$$, 'retry A with 1111 returns A''s stored result: call succeeds');
+select is(t10.snapv('ret7'), t10.stored('f1000000-0000-4000-8000-000000000801')::text, 'retry A with 1111 returns A''s stored result');
+select lives_ok($$select t10.snap('ret8', (public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '١١١١'))::text)$$, 'retry A with Arabic digits too: call succeeds');
+select is(t10.snapv('ret8'), t10.stored('f1000000-0000-4000-8000-000000000801')::text, 'retry A with Arabic digits too');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '2222')$$, 'P0001', 'REQUEST_ID_REUSED', 'A with 2222 (the current PIN) is refused');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000801', t10.uid('203'), '3333')$$, 'P0001', 'REQUEST_ID_REUSED', 'A with 3333 is refused');
 select throws_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000802', t10.uid('203'), '1111')$$, 'P0001', 'REQUEST_ID_REUSED', 'B with 1111 is refused');
-select is(public.admin_set_secret('f1000000-0000-4000-8000-000000000802', t10.uid('203'), '2222'), t10.stored('f1000000-0000-4000-8000-000000000802'), 'B with 2222 returns its result');
+select lives_ok($$select t10.snap('ret9', (public.admin_set_secret('f1000000-0000-4000-8000-000000000802', t10.uid('203'), '2222'))::text)$$, 'B with 2222 returns its result: call succeeds');
+select is(t10.snapv('ret9'), t10.stored('f1000000-0000-4000-8000-000000000802')::text, 'B with 2222 returns its result');
 select test.reset_role();
 select is(t10.world(), t10.snapv('w8'), 'nothing changed, no new revocation timestamps');
 select is(t10.hash('203'), t10.snapv('h203'), 'hash byte-identical');
@@ -361,13 +399,14 @@ select ok(t10.hm('203', '2222') and not t10.hm('203', '1111'), 'hash STILL match
 select is(t10.cv('203'), 2, 'version unchanged by the retries');
 
 -- same shape for create
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000811', '207', 'مدير 7', 'manager', 'BR-01', '1234')$$, 'create 207 with 1234');
 select lives_ok($$select public.admin_set_secret('f1000000-0000-4000-8000-000000000812', t10.uid('207'), '9999')$$, 'then change its PIN to 9999');
 select test.reset_role();
 select t10.snap('w8c', t10.world());
-select test.act_as('100');
-select is(public.admin_create_user('f1000000-0000-4000-8000-000000000811', '207', 'مدير 7', 'manager', 'BR-01', '1234'), t10.stored('f1000000-0000-4000-8000-000000000811'), 'retry of the create returns the stored result');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select lives_ok($$select t10.snap('ret10', (public.admin_create_user('f1000000-0000-4000-8000-000000000811', '207', 'مدير 7', 'manager', 'BR-01', '1234'))::text)$$, 'retry of the create returns the stored result: call succeeds');
+select is(t10.snapv('ret10'), t10.stored('f1000000-0000-4000-8000-000000000811')::text, 'retry of the create returns the stored result');
 select throws_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000811', '207', 'مدير 7', 'manager', 'BR-01', '9999')$$, 'P0001', 'REQUEST_ID_REUSED', 'create id with the current PIN is refused');
 select throws_ok($$select public.admin_create_user('f1000000-0000-4000-8000-000000000811', '207', 'مدير 7', 'manager', 'BR-01', '4321')$$, 'P0001', 'REQUEST_ID_REUSED', 'create id with another PIN is refused');
 select test.reset_role();
@@ -376,7 +415,7 @@ select ok(t10.hm('207', '9999') and not t10.hm('207', '1234') and t10.cv('207') 
 
 -- 9. deactivation (301) ----------------------------------------------------------------------------------
 select t10.snap('rev202b', t10.revts('202'));
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000901', t10.uid('301'), false)$$, 'owner deactivates 301');
 select test.reset_role();
 select is((select active from app_users where employee_number = '301'), false, 'inactive');
@@ -393,13 +432,14 @@ select t10.act_sess('301', '5e5e5e5e-0000-4000-8000-0000000002b1');
 select ok(not app.session_ok(), 'a new session of an inactive user is refused');
 select test.reset_role();
 select t10.snap('w9', t10.world());
-select test.act_as('100');
-select is(public.admin_set_user_active('f1000000-0000-4000-8000-000000000901', t10.uid('301'), false), t10.stored('f1000000-0000-4000-8000-000000000901'), 'replay returns the stored result');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select lives_ok($$select t10.snap('ret11', (public.admin_set_user_active('f1000000-0000-4000-8000-000000000901', t10.uid('301'), false))::text)$$, 'replay returns the stored result: call succeeds');
+select is(t10.snapv('ret11'), t10.stored('f1000000-0000-4000-8000-000000000901')::text, 'replay returns the stored result');
 select lives_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000902', t10.uid('301'), false)$$, 'deactivating an already inactive user succeeds');
 select test.reset_role();
 select is(t10.cv('301'), 1, 'version not bumped again');
 select is(t10.is_revoked('5e5e5e5e-0000-4000-8000-0000000002b1'), false, 'no extra revocation');
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000903', t10.uid('301'), true)$$, 'owner activates 301');
 select test.reset_role();
 select is((select active from app_users where employee_number = '301'), true, 'active again');
@@ -411,20 +451,21 @@ select t10.act_sess('301', '5e5e5e5e-0000-4000-8000-000000000301');
 select ok(not app.session_ok(), 'the old one is still refused');
 select test.reset_role();
 select t10.snap('w9b', t10.world());
-select test.act_as('100');
-select is(public.admin_set_user_active('f1000000-0000-4000-8000-000000000901', t10.uid('301'), false), t10.stored('f1000000-0000-4000-8000-000000000901'), 'replay of the deactivation after reactivation returns the stored result');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select lives_ok($$select t10.snap('ret12', (public.admin_set_user_active('f1000000-0000-4000-8000-000000000901', t10.uid('301'), false))::text)$$, 'replay of the deactivation after reactivation returns the stored result: call succeeds');
+select is(t10.snapv('ret12'), t10.stored('f1000000-0000-4000-8000-000000000901')::text, 'replay of the deactivation after reactivation returns the stored result');
 select throws_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000901', t10.uid('301'), true)$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other value');
 select test.reset_role();
 select is(t10.world(), t10.snapv('w9b'), 'the replay did not deactivate again');
 -- the seeded inactive user 299: deactivating it again is a no-op
 select t10.snap('w9c', t10.world());
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000904', t10.uid('299'), false)$$, 'deactivating inactive 299');
 select test.reset_role();
 select ok(t10.cv('299') = 0 and t10.nrev('299') = 0, 'no version bump and no revocation for a no-op deactivation');
 -- refusals
 select t10.snap('w9d', t10.world());
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select throws_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000911', t10.uid('100'), false)$$, 'P0001', 'USER_INVALID', 'owner cannot deactivate themselves');
 select throws_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000911', gen_random_uuid(), false)$$, 'P0001', 'USER_INVALID', 'unknown user');
 select throws_ok($$select public.admin_set_user_active('f1000000-0000-4000-8000-000000000911', null, false)$$, 'P0001', 'USER_INVALID', 'null user');
@@ -438,7 +479,7 @@ select ok((select active from app_users where employee_number = '100'), 'owner s
 update app_users set failed_attempts = 5, locked_until = clock_timestamp() + interval '15 minutes' where employee_number = '215';
 select t10.snap('rev215', t10.revts('215'));
 select t10.snap('h215', t10.hash('215'));
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select public.admin_unlock_user('f1000000-0000-4000-8000-000000001001', t10.uid('215'))$$, 'owner unlocks 215');
 select test.reset_role();
 select is((select concat_ws('|', failed_attempts, locked_until is null, active, credential_version) from app_users where employee_number = '215'), '0|t|t|0', 'attempts cleared, version unchanged');
@@ -447,18 +488,20 @@ select is(t10.hash('215'), t10.snapv('h215'), 'hash untouched');
 select is(t10.stored('f1000000-0000-4000-8000-000000001001'), jsonb_build_object('user_id', t10.uid('215')), 'stored result');
 update app_users set failed_attempts = 2 where employee_number = '215';
 select t10.snap('w10', t10.world());
-select test.act_as('100');
-select is(public.admin_unlock_user('f1000000-0000-4000-8000-000000001001', t10.uid('215')), t10.stored('f1000000-0000-4000-8000-000000001001'), 'replay returns the stored result');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
+select lives_ok($$select t10.snap('ret13', (public.admin_unlock_user('f1000000-0000-4000-8000-000000001001', t10.uid('215')))::text)$$, 'replay returns the stored result: call succeeds');
+select is(t10.snapv('ret13'), t10.stored('f1000000-0000-4000-8000-000000001001')::text, 'replay returns the stored result');
 select throws_ok($$select public.admin_unlock_user('f1000000-0000-4000-8000-000000001001', t10.uid('202'))$$, 'P0001', 'REQUEST_ID_REUSED', 'same id, other user');
 select throws_ok($$select public.admin_unlock_user('f1000000-0000-4000-8000-000000001002', gen_random_uuid())$$, 'P0001', 'USER_INVALID', 'unknown user');
 select throws_ok($$select public.admin_unlock_user('f1000000-0000-4000-8000-000000001002', null)$$, 'P0001', 'USER_INVALID', 'null user');
+select throws_ok($$select public.admin_unlock_user('f1000000-0000-4000-8000-000000001002', t10.uid('101'))$$, 'P0001', 'FORBIDDEN', 'another owner row is refused');
 select test.reset_role();
 select is(t10.world(), t10.snapv('w10'), 'replay did not unlock again; refusals changed nothing');
 
 -- 11. logout -----------------------------------------------------------------------------------------------------
 select t10.new_session('202', '5e5e5e5e-0000-4000-8000-0000000002b2');
 select t10.snap('rev215b', t10.revts('215'));
-select test.act_as('202');
+select t10.act_sess('202', '5e5e5e5e-0000-4000-8000-000000000202');
 select lives_ok($$select logout()$$, 'manager logs out');
 select ok(not app.session_ok(), 'the current session is revoked');
 select throws_ok($$select logout()$$, 'P0001', 'NOT_AUTHENTICATED', 'logging out twice is refused');
@@ -490,7 +533,7 @@ select is((select count(*) from rpc_requests where secret_verifier is not null),
           (select count(*) from rpc_requests where rpc_name in ('admin_create_user', 'admin_set_secret')), 'only the two secret RPCs keep a verifier');
 
 -- 13. the owner can log out too (last: it ends the owner session) -------------------------------------------------------
-select test.act_as('100');
+select t10.act_sess('100', '5e5e5e5e-0000-4000-8000-000000000100');
 select lives_ok($$select logout()$$, 'owner logs out');
 select ok(not app.session_ok(), 'owner session is revoked');
 select test.reset_role();
