@@ -151,7 +151,7 @@ select is((select array_agg(n order by n) from (
     select p.pronamespace::regnamespace::text || '.' || p.proname as n from pg_proc p
     where p.pronamespace in ('public'::regnamespace, 'app'::regnamespace)
       and (has_function_privilege('authenticated', p.oid, 'execute') or has_function_privilege('anon', p.oid, 'execute'))) s),
-  array['app.my_branch','app.my_role','app.session_ok','public.owner_resolve_transfer_line','public.receive_transfer','public.send_transfer'], 'functions executable by clients are exactly the three RLS helpers and the transfer RPCs');
+  array['app.my_branch','app.my_role','app.session_ok','public.create_purchase','public.edit_purchase_line','public.owner_resolve_transfer_line','public.receive_transfer','public.send_transfer','public.void_purchase_line'], 'functions executable by clients are exactly the three RLS helpers, the transfer RPCs and the purchase RPCs');
 -- tables created by later migrations start closed
 create table public.probe_tbl (id int generated always as identity primary key);
 select is_empty($$select 1 from information_schema.role_table_grants where table_name = 'probe_tbl' and grantee in ('anon','authenticated','PUBLIC')$$, 'new tables start closed');
