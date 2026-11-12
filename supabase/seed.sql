@@ -135,12 +135,24 @@ language sql as $$
   where s.user_id = u.id and u.employee_number = p_employee_number;
 $$;
 
--- Balance as the table owner (0 when the view has no row for the pair).
+-- Balance as the table owner (0 when the pair is not an active branch x active item).
+-- Computed from the tables directly, with the same arithmetic as the balances view,
+-- so it does not depend on the caller: the view filters rows by the caller's session.
 create function test.balance(p_branch text, p_item text) returns numeric
 language sql stable
 security definer set search_path = app, public, extensions, pg_temp as $$
-  select coalesce((select base_quantity from public.balances
-                   where branch_id = p_branch and item_id = p_item), 0)
+  select case when exists (select 1 from public.branches b, public.items i
+                           where b.id = p_branch and i.id = p_item and b.active and i.active)
+    then coalesce((select s.base_quantity from public.stock_baselines s
+                   where s.branch_id = p_branch and s.item_id = p_item
+                   order by s.effective_at desc, s.seq desc limit 1), 0)
+         + coalesce((select sum(m.base_quantity) from public.stock_movements m
+                     where m.branch_id = p_branch and m.item_id = p_item
+                       and m.occurred_at > coalesce((select s.effective_at from public.stock_baselines s
+                                                     where s.branch_id = p_branch and s.item_id = p_item
+                                                     order by s.effective_at desc, s.seq desc limit 1),
+                                                    '-infinity'::timestamptz)), 0)
+    else 0 end
 $$;
 
 -- Open the current month's (Asia/Amman) count window for a branch and
