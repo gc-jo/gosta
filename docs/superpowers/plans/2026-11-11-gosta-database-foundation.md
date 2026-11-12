@@ -269,7 +269,8 @@ rollback;
   - `app.lock_branches(variadic p_branch_ids text[]) returns timestamptz` — `pg_advisory_xact_lock(hashtextextended('branch:' || id, 0))` for each distinct id in ascending order, then returns `clock_timestamp()`.
   - `app.require_not_frozen(p_branch_id text) returns void` — `BRANCH_FROZEN` when any `counts` row for the branch has `frozen_since is not null`. Callers must already hold the branch lock.
   - `app.unit_rate(p_item_id text, p_unit text, p_allow_inactive boolean default false) returns numeric` — `ITEM_INVALID` (missing or inactive item), `UNIT_INVALID` (no such unit, or inactive and not allowed).
-  - `app.check_quantity(p_quantity numeric, p_allow_zero boolean) returns numeric` — `QUANTITY_INVALID` for null, negative, or zero when not allowed.
+  - `app.check_quantity(p_quantity numeric, p_allow_zero boolean) returns numeric` — `QUANTITY_INVALID` for null, `NaN`, `Infinity`, `-Infinity` (via `app.is_finite`), negative, or zero when not allowed. The finite test comes first: `NaN > 0` is true in Postgres, so a sign test alone lets `NaN` through.
+  - `app.check_cost(p_cost numeric) returns numeric` — null passes through as null; `COST_INVALID` for `NaN`, `Infinity`, `-Infinity` or negative. Every RPC validates costs with this and quantities with `check_quantity`, so a bad number is refused with a plain error code before it can reach a table check constraint.
   - `app.request_replay(p_request_id uuid, p_rpc_name text, p_user_id uuid, p_params jsonb) returns jsonb` — takes `pg_advisory_xact_lock(hashtextextended('req:' || p_request_id, 0))`. No row → null. Row with the same `rpc_name`, `user_id` and `request_hash` → its `result`. Anything else → `REQUEST_ID_REUSED`. `request_hash = encode(digest(p_rpc_name || ':' || p_params::text, 'sha256'), 'hex')`; `p_params` is a `jsonb` built by the RPC from all its arguments except secrets.
   - `app.request_store(p_request_id uuid, p_rpc_name text, p_user_id uuid, p_params jsonb, p_result jsonb, p_secret text default null) returns jsonb` — inserts and returns `p_result`. When `p_secret` is given it stores `secret_verifier = crypt(p_secret, gen_salt('bf', 10))`: a verifier that belongs to this request and never changes afterwards.
   - `app.request_secret_ok(p_request_id uuid, p_secret text) returns boolean` — `crypt(p_secret, secret_verifier) = secret_verifier` for that request row.
@@ -283,7 +284,7 @@ Complete list of error codes (the front-end plan maps exactly these):
 
 ```sql
 begin;
-select plan(17);
+select plan(29);  -- set to the real number of assertions if it differs; never drop one
 -- client-visible
 select test.act_as('201');
 select is(app.session_ok(), true); select is(app.my_branch(), 'BR-01'); select is(app.my_role(), 'manager');
@@ -303,6 +304,16 @@ select is(app.unit_rate('D-001','عبوة'), 750::numeric);
 select throws_ok($$select app.unit_rate('D-001','حبة')$$, 'UNIT_INVALID');
 select throws_ok($$select app.unit_rate('D-003','غم')$$, 'ITEM_INVALID');
 select throws_ok($$select app.check_quantity(0, false)$$, 'QUANTITY_INVALID');
+select is(app.check_quantity(0, true), 0::numeric); select is(app.check_quantity(2.5, false), 2.5::numeric);
+select throws_ok($$select app.check_quantity(null, true)$$, 'QUANTITY_INVALID');
+select throws_ok($$select app.check_quantity(-1, true)$$, 'QUANTITY_INVALID');
+select throws_ok($$select app.check_quantity('NaN', false)$$, 'QUANTITY_INVALID');
+select throws_ok($$select app.check_quantity('Infinity', false)$$, 'QUANTITY_INVALID');
+select throws_ok($$select app.check_quantity('-Infinity', true)$$, 'QUANTITY_INVALID');
+select is(app.check_cost(null), null::numeric); select is(app.check_cost(0), 0::numeric);
+select throws_ok($$select app.check_cost('NaN')$$, 'COST_INVALID');
+select throws_ok($$select app.check_cost('Infinity')$$, 'COST_INVALID');
+select throws_ok($$select app.check_cost(-0.01)$$, 'COST_INVALID');
 select throws_ok($$select app.require_feature('BR-15','send')$$, 'FEATURE_HIDDEN');
 select is(app.normalize_digits('٢٠١'), '201');
 -- replay: same values replay, changed values are refused
@@ -338,7 +349,7 @@ rollback;
 
 A receiving branch must not learn the sender's cost: `grant select (every column except cost_total) on transfer_lines to authenticated`, and expose cost through view `transfer_line_costs(line_id, cost_total)` (`security_invoker = false`) filtered to owner, or caller's branch = the transfer's `from_branch`.
 
-- [ ] **Step 1: Write the failing test `05_rls.test.sql`.** As postgres insert one purchase for `BR-01` and one for `BR-02`, and one transfer `BR-14 → BR-01` with one line, `cost_total = 12.5`. Then:
+- [ ] **Step 1: Write the failing test `05_rls.test.sql`.** As postgres insert one purchase for `BR-01` and one for `BR-02`, one transfer `BR-14 → BR-01` with one line, `cost_total = 12.5`, and one `stock_movements` row of +500 for (`BR-02`, `D-001`). Then the assertions below, **plus the balance-view test carried over from Task 3** (it could not fail there because no RLS existed): after `test.act_as('201')`, `select count(*) from balances where branch_id = 'BR-02'` is 0 and `select count(*) from balances where branch_id = 'BR-01'` is 2 (the view obeys RLS for the caller), while `test.balance('BR-02','D-001')` still returns 500 (the helper reads as the owner); as the owner (`test.act_as('100')`) `balances` shows the BR-02 row with 500. Raise the plan count accordingly.
 
 ```sql
 select plan(14);
