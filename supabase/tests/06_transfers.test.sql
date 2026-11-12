@@ -1,5 +1,5 @@
 begin;
-select plan(233);
+select plan(255);
 
 -- test-local helpers (rolled back with the transaction) ----------------------------------
 create schema t6;
@@ -162,6 +162,17 @@ select throws_ok($$select public.owner_resolve_transfer_line('e6000000-0000-4000
 select test.reset_role();
 select is((select count(*) from rpc_requests where request_id = 'e6000000-0000-4000-8000-000000000190'), 0::bigint, 'role refusals store nothing');
 
+-- null request id ------------------------------------------------------------------------------
+select test.act_as('301');
+select throws_ok($$select public.send_transfer(null, 'BR-01', jsonb_build_array(t6.sl('D-001', 1, 'مل', 1)))$$, 'P0001', 'REQUEST_ID_REQUIRED', 'send without request id');
+select test.act_as('201');
+select throws_ok($$select public.receive_transfer(null, t6.tid('e6000000-0000-4000-8000-000000000101'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000000101', 'D-001', 2, 'كرتونة')))$$, 'P0001', 'REQUEST_ID_REQUIRED', 'receive without request id');
+select test.act_as('100');
+select throws_ok($$select public.owner_resolve_transfer_line(null, t6.lid('e6000000-0000-4000-8000-000000000101', 'D-001'), 'deny')$$, 'P0001', 'REQUEST_ID_REQUIRED', 'owner resolve without request id');
+select test.reset_role();
+select is((select count(*) from transfers) + (select count(*) from rpc_requests where rpc_name <> 'send_transfer'), 2::bigint, 'null request ids wrote nothing');
+
 -- 12. receive in full + 14. second receive, replay, final lines ---------------------------------
 select t6.zero();
 select test.act_as('301');
@@ -181,6 +192,8 @@ select is(t6.ls('e6000000-0000-4000-8000-000000001201', 'D-001'), 'received|2|ك
 select is(t6.ls('e6000000-0000-4000-8000-000000001201', 'D-002'), 'received|1|كرتونة|1000|1000|10|1|كرتونة|1000|1000|~|~|false', 'D-002 final row: reason without a difference is null, blank note is null');
 select is(t6.resolver('e6000000-0000-4000-8000-000000001201', 'D-001'), '201', 'resolved_by is the receiver');
 select is((select count(*) from transfer_lines l where l.transfer_id = t6.tid('e6000000-0000-4000-8000-000000001201') and l.resolved_at is not null), 2::bigint, 'resolved_at set');
+select is((select count(*) from transfer_lines l join stock_movements m on m.ref_id = l.id and m.kind = 'transfer_in'
+           where l.transfer_id = t6.tid('e6000000-0000-4000-8000-000000001201') and m.occurred_at = l.resolved_at), 2::bigint, 'resolved_at equals the transfer_in time');
 select is(t6.mvx('e6000000-0000-4000-8000-000000001201', 'D-001', 'transfer_in'), 'BR-01|18000|false', 'transfer_in at the destination, not dated at the send');
 select ok((select min(i.occurred_at) from stock_movements i join transfer_lines l on l.id = i.ref_id
            where l.transfer_id = t6.tid('e6000000-0000-4000-8000-000000001201') and i.kind = 'transfer_in')
@@ -247,6 +260,7 @@ select is(test.balance('BR-14', 'D-001'), 0::numeric, 'source back to 0');
 select is(test.balance('BR-01', 'D-001'), 0::numeric, 'destination 0');
 select is(t6.ls('e6000000-0000-4000-8000-000000001501', 'D-001'), 'received|2|كرتونة|9000|18000|0|0|كرتونة|9000|0|not_loaded|~|false', 'zero row: cost 0, base 0');
 select is(t6.mvx('e6000000-0000-4000-8000-000000001501', 'D-001', 'transfer_adjust'), 'BR-14|18000|true', 'zero: full adjust back to the source');
+select ok((select l.resolved_at > t.created_at from transfer_lines l join transfers t on t.id = l.transfer_id where t.request_id = 'e6000000-0000-4000-8000-000000001501'), 'zero: resolved_at is after the send');
 
 -- 16. difference needs a reason, 17. partial confirm refused, 18. wrong branch ---------------------
 select t6.zero();
@@ -350,6 +364,8 @@ select is(test.balance('BR-14', 'D-001'), -18000::numeric, 'accept: source -1800
 select is(t6.ls('e6000000-0000-4000-8000-000000002401', 'D-001'), 'received|2|كرتونة|9000|18000|40|2|كرتونة|9000|18000|~|~|true', 'accept: final row, resolved_by_owner');
 select is(t6.resolver('e6000000-0000-4000-8000-000000002401', 'D-001'), '100', 'accept: resolved_by is the owner');
 select is(t6.mv('e6000000-0000-4000-8000-000000002401', 'transfer_adjust'), 0::bigint, 'accept: no adjust');
+select ok((select l.resolved_at = m.occurred_at from transfer_lines l join stock_movements m on m.ref_id = l.id and m.kind = 'transfer_in'
+           where l.id = t6.lid('e6000000-0000-4000-8000-000000002401', 'D-001')), 'accept: resolved_at equals the transfer_in time');
 select is(test.balance('BR-14', 'D-002'), -1000::numeric, 'the other line is still pending at the source');
 select is(test.balance('BR-01', 'D-002'), 0::numeric, 'and nothing at the destination');
 select test.act_as('100');
@@ -375,6 +391,7 @@ select is(test.balance('BR-01', 'D-001'), 0::numeric, 'deny: destination 0');
 select is(t6.ls('e6000000-0000-4000-8000-000000002501', 'D-001'), 'denied|2|كرتونة|9000|18000|40|~|~|~|~|~|~|true', 'deny: final row, no received_* values');
 select is(t6.resolver('e6000000-0000-4000-8000-000000002501', 'D-001'), '100', 'deny: resolved_by is the owner');
 select ok((select resolved_at is not null from transfer_lines where id = t6.lid('e6000000-0000-4000-8000-000000002501', 'D-001')), 'deny: resolved_at set');
+select ok((select l.resolved_at > t.created_at from transfer_lines l join transfers t on t.id = l.transfer_id where l.id = t6.lid('e6000000-0000-4000-8000-000000002501', 'D-001')), 'deny: resolved_at is after the send');
 select is(t6.mvx('e6000000-0000-4000-8000-000000002501', 'D-001', 'transfer_adjust'), 'BR-14|18000|true', 'deny: adjust +18000 at the source, dated at the send');
 select is(t6.mv('e6000000-0000-4000-8000-000000002501', 'transfer_in'), 0::bigint, 'deny: no destination movement');
 select test.act_as('100');
@@ -461,6 +478,36 @@ select test.reset_role();
 select is(test.balance('BR-14', 'D-001'), 50000::numeric, 'the baseline absorbed the send and its adjust: 50000');
 select is(test.balance('BR-01', 'D-001'), 9000::numeric, 'the receipt, dated now, counts at the destination');
 
+-- lenient reason on an exact receipt; cost kept exactly --------------------------------------------------------
+select t6.zero();
+select test.act_as('301');
+select lives_ok($$select public.send_transfer('e6000000-0000-4000-8000-000000003401', 'BR-01',
+  jsonb_build_array(t6.sl('D-001', 2, 'كرتونة', 40), t6.sl('D-002', 1, 'كرتونة', 10)))$$, 'send for exact receipts');
+select lives_ok($$select public.send_transfer('e6000000-0000-4000-8000-000000003403', 'BR-01', jsonb_build_array(t6.sl('D-001', 2, 'كرتونة', 40)))$$, 'send for short receipts');
+select lives_ok($$select public.send_transfer('e6000000-0000-4000-8000-000000003405', 'BR-01', jsonb_build_array(t6.sl('D-001', 2, 'كرتونة', 40)))$$, 'send for the reason replay');
+select lives_ok($$select public.send_transfer('e6000000-0000-4000-8000-000000003501', 'BR-01', jsonb_build_array(t6.sl('D-001', 1, 'كرتونة', 10.12345)))$$, 'send with a cost of 5 decimals');
+select test.act_as('201');
+select lives_ok($$select public.receive_transfer('e6000000-0000-4000-8000-000000003402', t6.tid('e6000000-0000-4000-8000-000000003401'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000003401', 'D-001', 2, 'كرتونة', ''), t6.rl('e6000000-0000-4000-8000-000000003401', 'D-002', 1, 'كرتونة', 'foo')))$$,
+  'exact receipt with an empty and a junk reason succeeds');
+select throws_ok($$select public.receive_transfer('e6000000-0000-4000-8000-000000003490', t6.tid('e6000000-0000-4000-8000-000000003403'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000003403', 'D-001', 1, 'كرتونة', '')))$$, 'P0001', 'DIFF_REASON_REQUIRED', 'short receipt with an empty reason');
+select throws_ok($$select public.receive_transfer('e6000000-0000-4000-8000-000000003490', t6.tid('e6000000-0000-4000-8000-000000003403'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000003403', 'D-001', 1, 'كرتونة', 'foo')))$$, 'P0001', 'DIFF_REASON_REQUIRED', 'short receipt with a junk reason');
+select lives_ok($$select public.receive_transfer('e6000000-0000-4000-8000-000000003406', t6.tid('e6000000-0000-4000-8000-000000003405'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000003405', 'D-001', 2, 'كرتونة', '')))$$, 'full receipt sent with an empty reason');
+select is((public.receive_transfer('e6000000-0000-4000-8000-000000003406', t6.tid('e6000000-0000-4000-8000-000000003405'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000003405', 'D-001', 2, 'كرتونة') - 'diff_reason'))),
+  jsonb_build_object('transfer_id', t6.tid('e6000000-0000-4000-8000-000000003405'), 'received', 1), 'retry without the key replays the stored result');
+select lives_ok($$select public.receive_transfer('e6000000-0000-4000-8000-000000003502', t6.tid('e6000000-0000-4000-8000-000000003501'),
+  jsonb_build_array(t6.rl('e6000000-0000-4000-8000-000000003501', 'D-001', 1, 'كرتونة')))$$, 'receive the 5-decimal cost in full');
+select test.reset_role();
+select is(t6.ls('e6000000-0000-4000-8000-000000003401', 'D-001'), 'received|2|كرتونة|9000|18000|40|2|كرتونة|9000|18000|~|~|false', 'empty reason stored as null');
+select is(t6.ls('e6000000-0000-4000-8000-000000003401', 'D-002'), 'received|1|كرتونة|1000|1000|10|1|كرتونة|1000|1000|~|~|false', 'junk reason stored as null');
+select is(t6.ls('e6000000-0000-4000-8000-000000003501', 'D-001'), 'received|1|كرتونة|9000|9000|10.12345|1|كرتونة|9000|9000|~|~|false', 'an exact receipt keeps the cost 10.12345');
+select is(t6.mv('e6000000-0000-4000-8000-000000003405', 'transfer_in'), 1::bigint, 'the replay wrote no second transfer_in');
+select is(t6.ls('e6000000-0000-4000-8000-000000003403', 'D-001'), 'pending|2|كرتونة|9000|18000|40|~|~|~|~|~|~|false', 'refused short receipts left the line pending');
+
 -- invariants over every line created above -----------------------------------------------------------------------
 select is_empty($$select l.id from transfer_lines l join transfers t on t.id = l.transfer_id
   where coalesce((select sum(m.base_quantity) from stock_movements m where m.ref_id = l.id and m.branch_id = t.from_branch), 0)
@@ -475,8 +522,6 @@ select is_empty($$select 1 from stock_movements m where m.ref_table = 'transfer_
 
 -- 30. frozen source / destination ---------------------------------------------------------------------------------
 select t6.zero();
-select test.act_as('202');
-select lives_ok($$select public.send_transfer('e6000000-0000-4000-8000-000000003201', 'BR-01', jsonb_build_array(t6.sl('D-001', 1, 'عبوة'), t6.sl('D-002', 1, 'حبة')))$$, 'a pending shipment for a later freeze');
 select test.reset_role();
 select test.freeze('BR-14');
 select test.act_as('301');

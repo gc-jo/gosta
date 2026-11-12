@@ -61,6 +61,7 @@ begin
   if v_diff and (p_diff_reason is null or p_diff_reason not in ('overloaded', 'count_error', 'not_loaded')) then
     raise exception 'DIFF_REASON_REQUIRED';
   end if;
+  -- cost is scaled and rounded to 3 decimals only when the received base differs from the sent base;
   -- an unchanged quantity keeps the cost exactly; a changed one is scaled and rounded to 3 places
   v_cost := case when v_line.cost_total is not null and v_diff
                  then round(v_line.cost_total * v_rbase / v_line.base_quantity, 3)
@@ -107,6 +108,9 @@ declare
   v_rate   numeric;
   v_result jsonb;
 begin
+  if p_request_id is null then
+    raise exception 'REQUEST_ID_REQUIRED';
+  end if;
   if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
     raise exception 'LINES_EMPTY';
   end if;
@@ -188,6 +192,9 @@ declare
   v_n       int := 0;
   v_result  jsonb;
 begin
+  if p_request_id is null then
+    raise exception 'REQUEST_ID_REQUIRED';
+  end if;
   if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
     raise exception 'LINES_EMPTY';
   end if;
@@ -200,10 +207,8 @@ begin
     v_unit := v_e ->> 'unit';
     if v_unit is null then raise exception 'UNIT_INVALID'; end if;
     v_qty := trim_scale(app.check_quantity(app.safe_numeric(v_e ->> 'quantity', 'QUANTITY_INVALID'), true));
-    v_reason := v_e ->> 'diff_reason';
-    if v_reason is not null and v_reason not in ('overloaded', 'count_error', 'not_loaded') then
-      raise exception 'DIFF_REASON_REQUIRED';
-    end if;
+    -- empty means absent; validity is judged only when the receipt differs from what was sent
+    v_reason := nullif(btrim(v_e ->> 'diff_reason'), '');
     v_lines := v_lines || jsonb_build_array(jsonb_build_object(
       'line_id', v_lid, 'quantity', v_qty, 'unit', v_unit, 'diff_reason', v_reason,
       'note', nullif(btrim(v_e ->> 'note'), '')));
@@ -270,6 +275,9 @@ declare
   v_new_base numeric;
   v_status   text;
 begin
+  if p_request_id is null then
+    raise exception 'REQUEST_ID_REQUIRED';
+  end if;
   -- A bad action is a programming error of the caller, not a state problem: FORBIDDEN.
   -- (No new error code is introduced for it.)
   if p_action is null or p_action not in ('accept', 'deny', 'edit_accept') then
@@ -294,11 +302,12 @@ begin
   select t.* into v_t from transfers t where t.id = v_tid;
 
   if p_action = 'deny' then
-    v_now := clock_timestamp();             -- no branch lock: nothing is dated "now" in a branch's stock
+    -- no branch lock: nothing is dated "now" in a branch's stock
     select l.* into v_line from transfer_lines l where l.id = p_line_id for update;
     if v_line.status <> 'pending' then
       raise exception 'LINE_NOT_PENDING';
     end if;
+    v_now := clock_timestamp();             -- taken after the row lock
     update transfer_lines
     set status = 'denied', resolved_by = v_user.id, resolved_at = v_now, resolved_by_owner = true
     where id = p_line_id;
