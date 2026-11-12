@@ -153,6 +153,8 @@ Known limit: a 4-digit PIN can still be guessed in days of patient trying, and a
 - The phone stays signed in for 7 days; a logout button is always visible.
 - Every RPC and every row-level-security policy checks that the user is active and that the token's own session (`session_id` claim) exists in `app_sessions`, is not revoked and has not expired. Deactivating a user or resetting their PIN revokes all their sessions; a later login creates a new session and does not revive an old one, so an old token or refresh token stays dead. A reset also advances the user's `credential_version`; a login that was verified with the old PIN but had not finished when the reset happened is refused at the last step.
 - Logout revokes the current session on the server.
+- **What revocation does and does not stop.** Authorization is checked when a request starts. A reset, deactivation or logout refuses every request that starts afterwards. Requests of that session that were already running at that moment — there can be several — finish normally and are logged under that user. This is accepted; the one exception is a password change, which rechecks before it writes.
+- **Owner lockout and recovery.** The 15-minute lockout after five wrong attempts applies to the owner as well, so the owner's password cannot be guessed without limit; the cost is that someone who knows the owner's employee number can keep the owner out for 15 minutes at a time. A lock always expires by itself. If the owner is locked out with no active session, has lost the password, or is being locked out repeatedly, recovery is done from the Supabase dashboard following `docs/runbooks/owner-account-recovery.md`.
 
 ### Permissions (enforced in the database)
 
