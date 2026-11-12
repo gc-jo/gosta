@@ -2,7 +2,7 @@
 -- Everything runs after test.act_as_service() unless a step says otherwise. Owner steps (reset, deactivate,
 -- create user) go through the real admin RPCs, acting as the owner, then switch back to the server role.
 begin;
-select plan(172);
+select plan(185);
 
 -- test-local helpers (rolled back with the transaction) --------------------------------------
 create schema t11;
@@ -89,7 +89,33 @@ $$;
 -- does any login log row carry the needle in its details?
 create function t11.leak(p_needle text) returns boolean language sql stable security definer set search_path = public as
 $$ select exists (select 1 from activity_log a where a.action like 'LOGIN\_%' and position(p_needle in a.details::text) > 0) $$;
+-- crypt calls so far in this transaction (needs track_functions = 'all', set below when the role may)
+create function t11.crypt_calls() returns bigint language sql as
+$$ select coalesce(sum(calls), 0)::bigint from pg_stat_xact_user_functions where funcname = 'crypt' and schemaname = 'extensions' $$;
+-- one assertion: this login_verify call runs extensions.crypt exactly p_expected times (skipped when untracked)
+create function t11.crypt_delta(p_desc text, p_emp text, p_secret text, p_expected bigint) returns setof text language plpgsql as $$
+declare v_before bigint; v_after bigint;
+begin
+  if current_setting('t11.track', true) is distinct from '1' then
+    return next skip(1, 'this role cannot set track_functions');
+    return;
+  end if;
+  v_before := t11.crypt_calls();
+  perform public.login_verify(p_emp, p_secret);
+  v_after := t11.crypt_calls();
+  return next is(v_after - v_before, p_expected, p_desc);
+end;
+$$;
 grant execute on all functions in schema t11 to authenticated, service_role;
+
+-- count extensions.crypt calls per login_verify call when this role may set track_functions (postgres on
+-- Supabase is not a superuser; without the privilege the crypt-count assertions are skipped, not failed)
+select set_config('t11.track', case when has_parameter_privilege(current_user, 'track_functions', 'set') then '1' else '0' end, true);
+do $$ begin
+  if current_setting('t11.track') = '1' then
+    set local track_functions = 'all';
+  end if;
+end $$;
 
 -- fixtures that no RPC can create (as postgres): a user without a secret row, a user whose
 -- Auth row is already taken by another app user
@@ -156,14 +182,16 @@ select is(t11.fa('201'), 1, 'wrong PIN counts (1)');
 select is(t11.r('999', '1111'), 'invalid', 'unknown number: invalid');
 select t11.lv('unk', '999', '1111');
 select is(t11.res('unk'), t11.inv(), 'unknown number: the same answer as a wrong PIN');
-select is(t11.r('299', '9999'), 'invalid', 'inactive user with the right PIN: invalid');
+select t11.lv('inact', '299', '9999');
+select is(t11.res('inact'), t11.inv(), 'inactive user with the right PIN: exactly the invalid answer');
 select is(t11.fa('299'), 0, 'inactive user: nothing counted');
 select is(t11.r('299', '0000'), 'invalid', 'inactive user with a wrong PIN: invalid');
 select is(t11.fa('299'), 0, 'inactive user: still nothing counted');
 select is(t11.r(null, '1111'), 'invalid', 'null number: invalid, no error');
 select is(t11.r('abc', '1111'), 'invalid', 'non-digit number: invalid, no error');
 select is(t11.r('', '1111'), 'invalid', 'empty number: invalid, no error');
-select is(t11.r('208', '1111'), 'invalid', 'a user without a secret row: invalid');
+select t11.lv('nosec', '208', '1111');
+select is(t11.res('nosec'), t11.inv(), 'a user without a secret row: exactly the invalid answer');
 select is(t11.fa('208'), 0, 'a user without a secret row: nothing to count against');
 select is(t11.r('00201', '1111'), 'invalid', '00201 is not 201');
 
@@ -204,6 +232,7 @@ select is(t11.fa('202'), 0, 'still 0 after locked attempts');
 select is(t11.lu('202')::text, t11.snapv('lu202'), 'a locked response does not extend the lock');
 select is(t11.logs('202'), 'LOGIN_FAILED,LOGIN_FAILED,LOGIN_FAILED,LOGIN_FAILED,LOGIN_LOCKED,LOGIN_LOCKED,LOGIN_LOCKED,LOGIN_LOCKED',
           'log: four failures, the locking attempt, three locked attempts');
+select * from t11.crypt_delta('locked: no crypt at all', '202', '2222', 0);
 select t11.set_lu('202', clock_timestamp() - interval '1 second');
 select is(t11.r('202', '2222'), 'ok', 'the lock has expired: the right PIN logs in');
 select is(t11.lu('202'), null, 'success clears locked_until');
@@ -384,6 +413,24 @@ select ok(not (t11.leak('1111') or t11.leak('0000') or t11.leak('2222') or t11.l
             or t11.leak('zzzz') or t11.leak('nope') or t11.leak('correct horse') or t11.leak('كلمة') or t11.leak('plain owner')
             or t11.leak(repeat('1', 200)) or t11.leak(repeat('x', 72)) or t11.leak('ببب')), 'log: no submitted secret appears in any login log row');
 select is(t11.lq($q$action like 'LOGIN\_%' and details - 'employee_number' <> '{}'::jsonb$q$), 0::bigint, 'log: details never hold any key but employee_number');
+
+-- 16. whitespace around the number (spaces only; zeros stay) ----------------------------------------------
+select t11.lv('sp201', ' 201 ', '7777');
+select is(t11.res('sp201') ->> 'employee_number', '201', 'surrounding spaces are trimmed: " 201 " logs in as 201');
+select t11.lv('sp0204', ' 0204 ', '4444');
+select is((t11.res('sp0204') ->> 'user_id')::uuid, t11.uid('0204'), '" 0204 " logs in as 0204, not as 204');
+select is(t11.r('2 01', '7777'), 'invalid', 'a number with an inner space is invalid');
+select is(t11.r(' 204 ', '4444'), 'invalid', '" 204 " is 204: the zeros of 0204 are not borrowed');
+
+-- 17. every path that reaches the secret check runs extensions.crypt exactly once (0 when locked, above) ---
+select * from t11.crypt_delta('crypt count: unknown number (dummy hash)', '999', '1111', 1);
+select * from t11.crypt_delta('crypt count: inactive user (dummy hash)', '299', '9999', 1);
+select * from t11.crypt_delta('crypt count: user without a secret row (dummy hash)', '208', '1111', 1);
+select * from t11.crypt_delta('crypt count: staff secret over 72 bytes (dummy hash, never the real one)', '203', repeat('1', 200), 1);
+select * from t11.crypt_delta('crypt count: null secret (dummy hash)', '203', null, 1);
+select * from t11.crypt_delta('crypt count: wrong secret (real hash)', '203', '0000', 1);
+select * from t11.crypt_delta('crypt count: right secret (real hash)', '203', '0303', 1);
+select * from t11.crypt_delta('crypt count: null number (dummy hash)', null, '0303', 1);
 
 select * from finish();
 rollback;

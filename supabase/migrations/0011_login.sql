@@ -38,7 +38,8 @@ $$;
 -- Never raises for a bad credential. Answers
 --   {"ok": true, "user_id", "auth_user_id" (may be null), "employee_number", "credential_version"}
 --   {"ok": false, "reason": "invalid" | "locked", "locked_until": timestamptz | null}
--- The employee number is normalised with normalize_digits and compared as text: leading zeros count.
+-- The employee number is trimmed of surrounding spaces (as admin_create_user does), normalised with normalize_digits
+-- and compared as text: leading zeros count.
 -- Staff secrets are normalised the way they were stored (normalize_digits); an owner password is compared
 -- exactly as typed. A null secret, or one over 72 bytes after that, is a wrong secret and never reaches
 -- crypt against the real hash (bcrypt reads only the first 72 bytes).
@@ -55,7 +56,7 @@ language plpgsql security definer
 set search_path = app, public, extensions, pg_temp as $$
 declare
   c_dummy constant text := '$2a$10$SLzXDiZ4WSsygwm7dDVGx.jDm0S5OEjzuVjqMxTibCmqbWRz963DW';
-  v_number text := app.normalize_digits(p_employee_number);
+  v_number text := app.normalize_digits(btrim(p_employee_number));  -- spaces only, like admin_create_user; zeros stay
   v_log    text;
   v_user   app_users;
   v_hash   text;
@@ -95,7 +96,9 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'invalid', 'locked_until', null);
   end if;
 
-  -- the same cleaning as when the secret was stored (clean_secret), without raising
+  -- Mirrors app.clean_secret (0010) by hand, without raising. The two MUST change together: staff secrets go
+  -- through app.normalize_digits, an owner password is used exactly as typed, and the limit is 72 bytes
+  -- (bcrypt reads no more). If clean_secret's rules change, change this block in the same migration.
   if p_secret is null then
     v_secret := null;
   elsif v_user.role = 'owner' then

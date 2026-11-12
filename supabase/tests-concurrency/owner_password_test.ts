@@ -12,7 +12,7 @@ import { actAsSession, backendPid, type Conn, connect, waitUntilBlocked } from "
 const P2 = "second password P2 !!";
 const P3 = "third password P3 ??";
 
-type Owner = { id: string; auth_user_id: string; secret_hash: string; credential_version: number; s1: string };
+type Owner = { id: string; auth_user_id: string; secret_hash: string; credential_version: number; s1: string; live: string[] };
 
 async function readOwner(setup: Conn): Promise<Owner> {
   const rows = await setup.unsafe(
@@ -25,6 +25,10 @@ async function readOwner(setup: Conn): Promise<Owner> {
   assertEquals(rows.length, 1, "the seeded owner 100 must exist");
   const o = rows[0] as unknown as Owner;
   assert(o.auth_user_id && o.s1, "the owner needs an Auth user and a live seeded session");
+  // every session that is unrevoked now: all of them are put back to unrevoked afterwards
+  const live = await setup.unsafe(
+    `select session_id::text as id from app_sessions where user_id = $1 and revoked_at is null`, [o.id]);
+  o.live = live.map((r) => (r as unknown as { id: string }).id);
   return o;
 }
 
@@ -36,8 +40,28 @@ async function restore(setup: Conn, o: Owner, s2: string, reqs: string[]) {
     `update app_users set credential_version = $2, failed_attempts = 0, locked_until = null where id = $1`,
     [o.id, o.credential_version]);
   await setup.unsafe(`delete from app_sessions where session_id = $1`, [s2]);
-  await setup.unsafe(`update app_sessions set revoked_at = null where session_id = $1`, [o.s1]);
+  for (const id of o.live) {
+    await setup.unsafe(`update app_sessions set revoked_at = null where session_id = $1`, [id]);
+  }
   await setup.unsafe(`delete from rpc_requests where request_id in ($1, $2)`, [reqs[0], reqs[1]]);
+}
+
+/**
+ * Restores the owner and checks the hash. Never throws: a failure is returned, so that an error in the
+ * clean-up cannot mask the error that made the test fail. A returned error is logged here and rethrown by
+ * the caller only when the test body itself succeeded.
+ */
+async function cleanUp(setup: Conn, owner: Owner | null, s2: string, reqs: string[]): Promise<Error | null> {
+  if (!owner) return null;
+  try {
+    await restore(setup, owner, s2, reqs);
+    const back = await setup.unsafe(`select secret_hash from app_user_secrets where user_id = $1`, [owner.id]);
+    assertEquals((back[0] as unknown as { secret_hash: string }).secret_hash, owner.secret_hash, "the owner's hash is restored");
+    return null;
+  } catch (e) {
+    console.error("clean-up of the owner's rows failed:", e);
+    return e as Error;
+  }
 }
 
 async function rollbackQuietly(c: Conn) {
@@ -55,6 +79,7 @@ Deno.test("owner password: a session revoked while it waited for the row lock ca
   const reqA = crypto.randomUUID();
   const reqB = crypto.randomUUID();
   let owner: Owner | null = null;
+  let restoreError: Error | null = null;
   try {
     owner = await readOwner(setup);
     const s1 = owner.s1;
@@ -111,16 +136,13 @@ Deno.test("owner password: a session revoked while it waited for the row lock ca
   } finally {
     await rollbackQuietly(a);
     await rollbackQuietly(b);
-    if (owner) {
-      await restore(setup, owner, s2, [reqA, reqB]);
-      const back = await setup.unsafe(`select secret_hash from app_user_secrets where user_id = $1`, [owner.id]);
-      assertEquals((back[0] as unknown as { secret_hash: string }).secret_hash, owner.secret_hash, "the owner's hash is restored");
-    }
+    restoreError = await cleanUp(setup, owner, s2, [reqA, reqB]);
     await a.end({ timeout: 5 });
     await b.end({ timeout: 5 });
     await admin.end({ timeout: 5 });
     await setup.end({ timeout: 5 });
   }
+  if (restoreError) throw restoreError; // only reached when the test body itself did not throw
 });
 
 Deno.test("control: one session changing the owner's password twice in a row works", async () => {
@@ -129,6 +151,7 @@ Deno.test("control: one session changing the owner's password twice in a row wor
   const s2 = crypto.randomUUID();
   const reqs = [crypto.randomUUID(), crypto.randomUUID()];
   let owner: Owner | null = null;
+  let restoreError: Error | null = null;
   try {
     owner = await readOwner(setup);
     await setup.unsafe(
@@ -153,12 +176,9 @@ Deno.test("control: one session changing the owner's password twice in a row wor
     assertEquals(state.s1_revoked, true, "the other owner session was revoked by the first change");
   } finally {
     await rollbackQuietly(a);
-    if (owner) {
-      await restore(setup, owner, s2, reqs);
-      const back = await setup.unsafe(`select secret_hash from app_user_secrets where user_id = $1`, [owner.id]);
-      assertEquals((back[0] as unknown as { secret_hash: string }).secret_hash, owner.secret_hash, "the owner's hash is restored");
-    }
+    restoreError = await cleanUp(setup, owner, s2, reqs);
     await a.end({ timeout: 5 });
     await setup.end({ timeout: 5 });
   }
+  if (restoreError) throw restoreError; // only reached when the test body itself did not throw
 });

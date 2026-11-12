@@ -101,7 +101,7 @@ select is((select count(*) from purchases), 2::bigint, 'owner sees all');
 select is((select count(*) from app_users), 7::bigint, 'owner sees all users');
 select is((select count(*) from stock_movements), 4::bigint, 'owner sees every movement');
 select is((select count(*) from purchase_line_history), 1::bigint, 'owner reads purchase_line_history');
-select is((select count(*) from activity_log), 1::bigint, 'owner reads activity_log');
+select is((select count(*) from activity_log where action = 'fixture'), 1::bigint, 'owner reads activity_log');
 select is((select cost_total from transfer_line_costs), 12.5::numeric, 'owner sees cost');
 select is((select base_quantity from balances where branch_id = 'BR-02' and item_id = 'D-001'), 500::numeric, 'owner sees BR-02/D-001 = 500');
 select is((select base_quantity from balances where branch_id = 'BR-02' and item_id = 'D-002'), 50::numeric, 'owner sees BR-02/D-002 = baseline 40 + later 10');
