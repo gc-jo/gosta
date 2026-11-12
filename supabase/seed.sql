@@ -143,16 +143,16 @@ language sql stable
 security definer set search_path = app, public, extensions, pg_temp as $$
   select case when exists (select 1 from public.branches b, public.items i
                            where b.id = p_branch and i.id = p_item and b.active and i.active)
-    then coalesce((select s.base_quantity from public.stock_baselines s
-                   where s.branch_id = p_branch and s.item_id = p_item
-                   order by s.effective_at desc, s.seq desc limit 1), 0)
-         + coalesce((select sum(m.base_quantity) from public.stock_movements m
-                     where m.branch_id = p_branch and m.item_id = p_item
-                       and m.occurred_at > coalesce((select s.effective_at from public.stock_baselines s
-                                                     where s.branch_id = p_branch and s.item_id = p_item
-                                                     order by s.effective_at desc, s.seq desc limit 1),
-                                                    '-infinity'::timestamptz)), 0)
+    then coalesce(bl.base_quantity, 0) + coalesce((
+           select sum(m.base_quantity) from public.stock_movements m
+           where m.branch_id = p_branch and m.item_id = p_item
+             and (bl.effective_at is null or m.occurred_at > bl.effective_at)), 0)
     else 0 end
+  from (select 1) one
+  left join lateral (
+    select s.base_quantity, s.effective_at from public.stock_baselines s
+    where s.branch_id = p_branch and s.item_id = p_item
+    order by s.effective_at desc, s.seq desc limit 1) bl on true
 $$;
 
 -- Open the current month's (Asia/Amman) count window for a branch and

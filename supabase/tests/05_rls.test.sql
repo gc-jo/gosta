@@ -1,5 +1,5 @@
 begin;
-select plan(70);
+select plan(80);
 
 -- fixtures (as postgres) ---------------------------------------------------
 insert into purchases(id, request_id, branch_id, supplier_id, created_by) values
@@ -71,11 +71,25 @@ select is((select array_agg(item_id order by item_id) from balances), array['D-0
 select is((select base_quantity from balances where item_id = 'D-001'), 7500::numeric, 'own D-001 balance');
 select is(test.balance('BR-02', 'D-001'), 500::numeric, 'test.balance reads the true ledger while acting as a manager');
 
+-- leak probes: a caller's cheap function must not see rows the view filters out.
+-- The temp table and function are created by the caller itself (authenticated has TEMP).
+create temp table seen(src text, v numeric);
+create function pg_temp.leak_cost(numeric) returns boolean language plpgsql cost 0.0000001
+  as $f$ begin insert into seen values ('cost', $1); return true; end $f$;
+create function pg_temp.leak_qty(numeric) returns boolean language plpgsql cost 0.0000001
+  as $f$ begin insert into seen values ('qty', $1); return true; end $f$;
+select is((select count(*) from transfer_line_costs where pg_temp.leak_cost(cost_total)), 0::bigint, 'leak probe on transfer_line_costs runs');
+select is_empty($$select 1 from seen where src = 'cost'$$, 'transfer_line_costs: no cost_total reaches a caller function before the filter');
+select is((select count(*) from balances where pg_temp.leak_qty(base_quantity)), 2::bigint, 'leak probe on balances runs');
+select is_empty($$select 1 from seen where src = 'qty' and v in (500, 50)$$, 'balances: no other-branch quantity reaches a caller function');
+
 -- manager 202 (BR-02) ----------------------------------------------------------
 select test.act_as('202');
 select is((select count(*) from transfers), 0::bigint, 'uninvolved branch sees nothing');
 select is((select base_quantity from balances where branch_id = 'BR-02' and item_id = 'D-001'), 500::numeric, 'BR-02 manager sees own D-001');
 select is((select count(*) from balances where branch_id = 'BR-01'), 0::bigint, 'BR-02 manager sees nothing for BR-01');
+select is((select count(*) from (select id, transfer_id, item_id from transfer_lines) l), 0::bigint, 'uninvolved branch sees no transfer lines');
+select is((select count(*) from transfer_line_costs), 0::bigint, 'uninvolved branch sees no costs');
 
 -- distributor 301 (BR-14) --------------------------------------------------------
 select test.act_as('301');
@@ -101,6 +115,16 @@ select is(test.balance('BR-02', 'D-001'), 500::numeric, 'test.balance after rese
 set local role anon;
 select throws_ok('select * from items', '42501', null, 'anon cannot read items');
 select throws_ok('select * from balances', '42501', null, 'anon cannot read balances');
+select test.reset_role();
+
+-- revoked session and inactive user ---------------------------------------------
+update app_sessions set revoked_at = clock_timestamp() where user_id = (select id from app_users where employee_number = '203');
+select test.act_as('203');
+select is((select count(*) from items), 0::bigint, 'revoked session reads nothing');
+select is((select count(*) from balances), 0::bigint, 'revoked session sees no balances');
+select test.act_as('299');
+select is((select count(*) from items), 0::bigint, 'inactive user reads nothing');
+select is((select count(*) from balances), 0::bigint, 'inactive user sees no balances');
 select test.reset_role();
 
 -- expired session ----------------------------------------------------------------

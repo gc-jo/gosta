@@ -113,7 +113,9 @@ create policy activity_log_select on activity_log for select to authenticated
 -- transfer_line_costs: the sender's cost. Owned by postgres and not security
 -- invoker, so it reads transfer_lines past the column grant and past RLS; the
 -- where clause is therefore the whole access rule.
-create view transfer_line_costs with (security_invoker = false) as
+-- security_barrier: without it the planner may run a caller's function on cost_total
+-- before the where clause, leaking costs of rows the caller may not see.
+create view transfer_line_costs with (security_invoker = false, security_barrier = true) as
 select l.id as line_id, l.cost_total
 from transfer_lines l
 join transfers t on t.id = l.transfer_id
@@ -121,7 +123,10 @@ where (select app.session_ok())
   and ((select app.my_role()) = 'owner' or t.from_branch = (select app.my_branch()));
 grant select on transfer_line_costs to authenticated;
 
--- balances: same columns and arithmetic as 0004, plus a row filter. Reference
+-- balances: a CLIENT-FACING view, filtered by the caller's session. postgres, service_role
+-- and any code without session claims get NO rows from it, so RPCs and service jobs must
+-- compute balances from the tables, never from this view.
+-- Same columns and arithmetic as 0004, plus a row filter. Reference
 -- tables are readable by any valid session, so without the filter a manager would
 -- get a zero row for every other branch. Owner sees every branch; anyone else only
 -- their own; no valid session, no rows. security_invoker keeps the caller's RLS
