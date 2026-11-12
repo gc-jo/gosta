@@ -405,6 +405,7 @@ Rules beyond spec section 6.2:
   - If `received_base_quantity <> base_quantity`, `diff_reason` is required (`DIFF_REASON_REQUIRED`). No `transfer_in` row when received is 0. `transfer_in.occurred_at = v_now`. `transfer_adjust` at the source = `base_quantity − received_base_quantity` (negative when overloaded), `occurred_at` = `transfers.created_at`. `cost_total := round(cost_total × received_base / base, 3)` when cost is not null.
 - `owner_resolve_transfer_line`: role `owner`. Read the line's transfer to learn the branches; for `accept` and `edit_accept` lock the destination and `require_not_frozen` it; then `select … for update` the line and only then check `status = 'pending'` (`LINE_NOT_PENDING`). `edit_accept` requires `p_quantity > 0` and `p_unit`; the rate follows the **edit conversion rule** of Task 7 (same unit → the line's stored `unit_rate`; different unit → that unit's current active rate); it writes `transfer_adjust` at the source for `old_base − new_base` dated at the send time, updates `quantity`/`unit`/`unit_rate`/`base_quantity`, scales cost, then accepts in full. `deny`: `transfer_adjust` +`base_quantity` at the source dated at the send time; no destination movement; no branch lock. All three set `resolved_by_owner = true`.
 - Every path sets `resolved_by`, `resolved_at` (`v_now`, or `clock_timestamp()` for `deny`).
+- **Numeric fingerprint rule (all RPCs in Tasks 6–10 that take a number).** Before calling `request_replay`, rebuild the parameters from typed values: every quantity and cost goes through `app.check_quantity` / `app.check_cost` and then `trim_scale(...)`, text ids and units are taken as given, and `p_lines` is rebuilt element by element with `jsonb_build_object` in the caller's order. `2`, `2.0` and `2.00` must produce the same `request_hash`; a retry is a retry however the phone formats the number.
 
 - [ ] **Step 1: Write the failing tests `06_transfers.test.sql`.** Each asserts with `test.balance` and row checks. Baseline for arithmetic tests: `301` sends `BR-14 → BR-01`: `D-001` 2 `كرتونة` (18000 مل) cost 40, and `D-002` 1 `كرتونة` (1000) cost 10.
 
@@ -414,6 +415,7 @@ Rules beyond spec section 6.2:
 | send idempotent | same id and body twice → same `transfer_id`, one transfer |
 | replay with changed values | same id, quantity 3 instead of 2 → `REQUEST_ID_REUSED`; still one transfer of 2 |
 | request id from another user | → `REQUEST_ID_REUSED` |
+| **numeric fingerprint** | same id, same body except quantity written `2.0` instead of `2` and cost `40.00` instead of `40` → replays the same `transfer_id` (not `REQUEST_ID_REUSED`); same id with quantity `2.5` → `REQUEST_ID_REUSED`. Same pair of checks for `receive_transfer` (received quantity `1.0` vs `1`) and `owner_resolve_transfer_line` (`p_quantity` `1.0` vs `1`) |
 | distributor needs cost | → `COST_REQUIRED` |
 | manager cost optional | `201` sends to `BR-02` without cost → ok |
 | bad destination | `BR-14` (self), `BR-09` (inactive), `BR-XX` → `BRANCH_INVALID` each |
@@ -469,6 +471,7 @@ Rules beyond spec section 6.3:
 |---|---|
 | create | `201` buys `D-001` 3 `عبوة` from `S-01` → `balance(BR-01,D-001) = 2250` |
 | idempotent / changed values | same id + body → same `purchase_id`, balance 2250; same id with 4 `عبوة` → `REQUEST_ID_REUSED` |
+| **numeric fingerprint** | same id with quantity `3.0` and cost written with trailing zeros → replays the same `purchase_id`; `edit_purchase_line` retried with `p_quantity` `1.0` vs `1` and `p_cost_total` `5.00` vs `5` → replays, one history row |
 | distributor needs cost | `301` without cost → `COST_REQUIRED` |
 | inactive supplier | `S-02` → `SUPPLIER_INVALID` |
 | item not sold by supplier | `D-002` from `S-01` → `ITEM_NOT_ALLOWED` |
@@ -612,6 +615,7 @@ Rules:
   - `set_branch_feature(p_request_id uuid, p_branch_id text, p_feature_key text, p_visible boolean) returns jsonb`.
   - `logout() returns void` — revokes the caller's current `app_sessions` row.
   - Internal `app.clean_secret(p_role text, p_secret text) returns text`: manager/distributor → `normalize_digits`, then must be exactly 4 ASCII digits; owner → returned exactly as given (no normalisation), at least 12 characters; else `SECRET_WEAK`.
+  - **bcrypt boundary.** bcrypt reads only the first 72 **bytes** of its input, silently, so two long passwords that differ only after byte 72 would be the same password. `clean_secret` therefore raises `SECRET_TOO_LONG` when `octet_length(p_secret) > 72` (bytes, not characters: an Arabic letter is 2 bytes, so the limit can be 36 Arabic characters). Every value passed to `extensions.crypt` in this plan — the stored hash, the request verifier in `app.request_store`, the comparison in `login_verify` — has passed this check or is refused before `crypt` is called. Add `SECRET_TOO_LONG` to the error-code list.
   - Internal `app.revoke_sessions(p_user_id uuid) returns void` — sets `revoked_at = clock_timestamp()` on every unrevoked session of the user.
 
 Rules:
@@ -630,6 +634,7 @@ Rules:
 | create | owner creates `204`, manager, `BR-02`, `4444` → row exists; hash exists and `secret_hash <> '4444'` |
 | Arabic-digit PIN | create `205` with `٥٥٥٥` → `crypt('5555', secret_hash) = secret_hash` |
 | weak secrets | manager `12345`, manager `12a4`, owner `short` → `SECRET_WEAK` |
+| **bcrypt boundary** | owner password of exactly 72 ASCII bytes → accepted, and the stored hash does **not** match the same string with its last character changed; 73 ASCII bytes → `SECRET_TOO_LONG`; 36 Arabic letters (72 bytes) → accepted; 37 Arabic letters (74 bytes, 37 characters) → `SECRET_TOO_LONG`; nothing is stored and no request row is written on refusal |
 | duplicate | `201` again → `EMPLOYEE_NUMBER_TAKEN` |
 | role/branch mismatch | → `USER_INVALID` |
 | not owner | `201` calls any admin RPC → `FORBIDDEN` |
@@ -668,6 +673,7 @@ Rules:
 - Wrong secret: `failed_attempts += 1`; on reaching 5 set `locked_until = clock_timestamp() + interval '15 minutes'`, reset `failed_attempts = 0`.
 - Correct secret: `failed_attempts = 0`, `locked_until = null`; then call `login_attach_auth_user` so a half-finished earlier provisioning is repaired here. It does not create a session.
 - Every call writes `activity_log` with `LOGIN_OK`, `LOGIN_FAILED` or `LOGIN_LOCKED`; `details` holds the employee number, never the secret.
+- **bcrypt boundary.** A submitted secret with `octet_length > 72` is treated as a wrong secret (`invalid`, counted towards lockout, dummy-hash timing preserved) and is never passed to `extensions.crypt`: otherwise a 73-byte guess whose first 72 bytes match would log in.
 
 - [ ] **Step 1: Write the failing tests `10_login.test.sql`** (after `test.act_as_service()` unless stated)
 
@@ -677,6 +683,7 @@ Rules:
 | Arabic digits, staff | `('٢٠١','١١١١')` → ok |
 | owner password exact | `('100','correct horse battery')` → ok; `('100','1111')` → `invalid`. Set the owner's password to `كلمة سر ١٢٣٤٥٦` via `admin_set_secret`; that exact string → ok; the same with `123456` in Latin digits → `invalid` |
 | wrong / unknown / inactive | `('201','0000')`, `('999','1111')`, `('299','1111')` → all `invalid` |
+| **bcrypt boundary** | set the owner's password to a 72-byte string P; `login_verify('100', P)` → ok; `login_verify('100', P || 'x')` (73 bytes, first 72 identical) → `invalid`; a 200-byte secret for `201` → `invalid`, no error |
 | lockout | five wrong for `202` → fifth returns `locked`, `locked_until` ≈ +15 min; the right PIN now → `locked` |
 | lock expires | set `locked_until` to the past → right PIN → ok |
 | success resets counter | four wrong, one right, four wrong → not locked |
