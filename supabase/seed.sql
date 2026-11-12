@@ -135,6 +135,31 @@ language sql as $$
   where s.user_id = u.id and u.employee_number = p_employee_number;
 $$;
 
+-- Balance as the table owner (0 when the view has no row for the pair).
+create function test.balance(p_branch text, p_item text) returns numeric
+language sql stable as $$
+  select coalesce((select base_quantity from public.balances
+                   where branch_id = p_branch and item_id = p_item), 0)
+$$;
+
+-- Open the current month's (Asia/Amman) count window for a branch and
+-- freeze it with a draft count. Idempotent.
+create function test.freeze(p_branch text) returns void
+language plpgsql as $$
+declare
+  v_month date := date_trunc('month', now() at time zone 'Asia/Amman')::date;
+  v_owner uuid := (select id from public.app_users where employee_number = '100');
+begin
+  insert into public.count_windows (branch_id, period_month, status, opened_by)
+  values (p_branch, v_month, 'open', v_owner)
+  on conflict (branch_id, period_month) do nothing;
+  insert into public.counts (branch_id, period_month, status, frozen_since)
+  values (p_branch, v_month, 'draft', clock_timestamp())
+  on conflict (branch_id, period_month) do update
+    set frozen_since = coalesce(public.counts.frozen_since, excluded.frozen_since);
+end;
+$$;
+
 grant execute on all functions in schema test to anon, authenticated, service_role;
 
 commit;
