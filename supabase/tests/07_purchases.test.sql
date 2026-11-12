@@ -1,5 +1,5 @@
 begin;
-select plan(226);
+select plan(259);
 
 -- test-local helpers (rolled back with the transaction) ----------------------------------
 create schema t7;
@@ -41,13 +41,13 @@ create function t7.ledger_ok(p_line uuid) returns boolean language sql stable se
 $$ select coalesce((select sum(m.base_quantity) from stock_movements m where m.ref_id = p_line), 0)
         = (select case when l.voided_at is null then l.base_quantity else 0 end from purchase_lines l where l.id = p_line) $$;
 
--- every purchase_adjust of a line is dated exactly at the purchase's created_at and strictly before
--- the history row written by the same call (zipped by write order)
+-- every purchase_adjust of a line is dated exactly at the purchase's created_at and strictly before the
+-- EARLIEST history row of the line (no pairing by position: not every call writes both rows)
 create function t7.adjust_dating_ok(p_line uuid) returns boolean language sql stable security definer set search_path = public as
-$$ select coalesce(bool_and(m.occurred_at = p.created_at and m.occurred_at < h.changed_at), false)
-   from (select m.*, row_number() over (order by m.created_at, m.id) rn from stock_movements m where m.ref_id = p_line and m.kind = 'purchase_adjust') m
-   join (select h.*, row_number() over (order by h.changed_at, h.id) rn from purchase_line_history h where h.purchase_line_id = p_line) h using (rn)
-   join purchase_lines l on l.id = p_line join purchases p on p.id = l.purchase_id $$;
+$$ select count(*) > 0 and coalesce(bool_and(m.occurred_at = p.created_at
+          and m.occurred_at < (select min(h.changed_at) from purchase_line_history h where h.purchase_line_id = p_line)), false)
+   from stock_movements m join purchase_lines l on l.id = m.ref_id join purchases p on p.id = l.purchase_id
+   where m.ref_id = p_line and m.kind = 'purchase_adjust' $$;
 
 create function t7.adjust_n(p_line uuid) returns bigint language sql stable security definer set search_path = public as
 $$ select count(*) from stock_movements m where m.ref_id = p_line and m.kind = 'purchase_adjust' $$;
@@ -387,7 +387,7 @@ select is(test.balance('BR-01', 'D-001'), 750::numeric, 'balance: A voided (0) +
 select is((select string_agg(trim_scale(m.base_quantity)::text, ',' order by m.created_at, m.id) from stock_movements m where m.ref_id = t7.lid('e7000000-0000-4000-8000-000000000701') and m.kind = 'purchase_adjust'), '-750,-750,-1500', 'adjusts: -750, -750, then the void reverses -1500');
 select is((select count(*) from stock_movements m join purchase_lines l on l.id = m.ref_id join purchases p on p.id = l.purchase_id
            where l.id = t7.lid('e7000000-0000-4000-8000-000000000701') and m.kind = 'purchase_adjust' and m.occurred_at = p.created_at), 3::bigint, 'all three adjustments (two edits, one void) are dated exactly at purchases.created_at');
-select ok(t7.adjust_dating_ok(t7.lid('e7000000-0000-4000-8000-000000000701')), 'each adjustment is strictly earlier than the history row of its own call');
+select ok(t7.adjust_dating_ok(t7.lid('e7000000-0000-4000-8000-000000000701')), 'each adjustment is strictly earlier than the earliest history row of the line');
 select is(t7.adjust_n(t7.lid('e7000000-0000-4000-8000-000000000701')), 3::bigint, 'three adjustments in total');
 select throws_ok($$update purchase_line_history set action = 'void' where purchase_line_id = t7.lid('e7000000-0000-4000-8000-000000000701')$$, 'P0001', 'IMMUTABLE_ROW', 'history cannot be updated');
 select throws_ok($$delete from purchase_line_history where purchase_line_id = t7.lid('e7000000-0000-4000-8000-000000000701')$$, 'P0001', 'IMMUTABLE_ROW', 'history cannot be deleted');
@@ -455,6 +455,31 @@ select is(t7.hn(t7.lid('e7000000-0000-4000-8000-000000000911')) || '|' || t7.adj
   '1|1|2|1|1', 'void replays wrote nothing');
 select is(test.balance('BR-01', 'D-001'), 750::numeric, 'balances: line 901 is 750, line 911 is voided');
 
+-- 19b. literal void: a zeroed item, one line, void -> balance 0 -----------------------------
+select t7.zero();
+select test.act_as('201');
+select lives_ok($$select public.create_purchase('e7000000-0000-4000-8000-000000000971', 'S-01', jsonb_build_array(t7.pl('D-001', 1, 'عبوة', 10)))$$, 'buy one line from a zeroed state');
+select test.reset_role();
+select is(test.balance('BR-01', 'D-001'), 750::numeric, 'balance 750 after the purchase');
+select test.act_as('100');
+select lives_ok($$select public.void_purchase_line('e7000000-0000-4000-8000-000000000972', t7.lid('e7000000-0000-4000-8000-000000000971'))$$, 'void it');
+select test.reset_role();
+select is(test.balance('BR-01', 'D-001'), 0::numeric, 'void: balance is exactly 0');
+select ok(t7.ledger_ok(t7.lid('e7000000-0000-4000-8000-000000000971')), 'ledger equals the record: voided, sum 0');
+
+-- 19c. dating helper with a call that writes history but no adjustment ----------------------
+select t7.zero();
+select test.act_as('201');
+select lives_ok($$select public.create_purchase('e7000000-0000-4000-8000-000000000981', 'S-01', jsonb_build_array(t7.pl('D-001', 3, 'عبوة', 10)))$$, 'buy 3 عبوة');
+select test.act_as('100');
+select lives_ok($$select public.edit_purchase_line('e7000000-0000-4000-8000-000000000982', t7.lid('e7000000-0000-4000-8000-000000000981'), 3, 'عبوة', 12)$$, 'cost-only edit (history, no adjust)');
+select lives_ok($$select public.edit_purchase_line('e7000000-0000-4000-8000-000000000983', t7.lid('e7000000-0000-4000-8000-000000000981'), 2, 'عبوة', 12)$$, 'quantity edit (history and adjust)');
+select lives_ok($$select public.void_purchase_line('e7000000-0000-4000-8000-000000000984', t7.lid('e7000000-0000-4000-8000-000000000981'))$$, 'void (history and adjust)');
+select test.reset_role();
+select is(t7.hn(t7.lid('e7000000-0000-4000-8000-000000000981')) || '|' || t7.adjust_n(t7.lid('e7000000-0000-4000-8000-000000000981')) || '|' || t7.ha(t7.lid('e7000000-0000-4000-8000-000000000981')), '3|2|edit,edit,void', 'three history rows but only two adjustments');
+select ok(t7.adjust_dating_ok(t7.lid('e7000000-0000-4000-8000-000000000981')), 'dating helper holds where position pairing would not');
+select ok(t7.ledger_ok(t7.lid('e7000000-0000-4000-8000-000000000981')), 'ledger equals the record');
+
 -- 19. frozen branch: create refused, owner corrections allowed ------------------------------
 select t7.zero();
 select test.act_as('201');
@@ -472,6 +497,47 @@ select is(t7.ls(t7.lid('e7000000-0000-4000-8000-000000000951')) || '|' || t7.ls(
 select ok(t7.ledger_ok(t7.lid('e7000000-0000-4000-8000-000000000951')) and t7.ledger_ok(t7.lid('e7000000-0000-4000-8000-000000000961')) and t7.adjust_dating_ok(t7.lid('e7000000-0000-4000-8000-000000000951')) and t7.adjust_dating_ok(t7.lid('e7000000-0000-4000-8000-000000000961')),
   'frozen: ledger equals the record and the corrections are dated at the purchase');
 select is((select count(*) from purchases where request_id = 'e7000000-0000-4000-8000-000000000990'), 0::bigint, 'the refused create left no purchase');
+
+-- 19d. internal action guard ---------------------------------------------------------------
+select throws_ok($$select app.purchase_line_change(t7.lid('e7000000-0000-4000-8000-000000000711'), 'bogus', 1, 'عبوة', null, (select id from app_users where employee_number = '100'))$$, 'P0001', 'FORBIDDEN', 'unknown action is refused');
+select throws_ok($$select app.purchase_line_change(t7.lid('e7000000-0000-4000-8000-000000000711'), null, 1, 'عبوة', null, (select id from app_users where employee_number = '100'))$$, 'P0001', 'FORBIDDEN', 'null action is refused');
+select is(t7.ls(t7.lid('e7000000-0000-4000-8000-000000000711')) || '|' || t7.hn(t7.lid('e7000000-0000-4000-8000-000000000711')) || '|' || t7.adjust_n(t7.lid('e7000000-0000-4000-8000-000000000711')), '1|عبوة|750|750|5|false|1|1', 'a refused action wrote nothing (line B: one edit before)');
+
+-- 19e. bounded quantities and costs (helpers of 0005 hardened in 0008) -----------------------
+select lives_ok($$select app.check_quantity(1000000000000, false)$$, 'quantity 10^12 passes');
+select throws_ok($$select app.check_quantity(1000000000001, false)$$, 'P0001', 'QUANTITY_INVALID', 'quantity above 10^12 is refused');
+select throws_ok($$select app.check_quantity(1000000000001, true)$$, 'P0001', 'QUANTITY_INVALID', 'also when zero is allowed');
+select is(app.check_quantity(0, true), 0::numeric, 'zero still passes where allowed');
+select lives_ok($$select app.check_cost(1000000000000)$$, 'cost 10^12 passes');
+select throws_ok($$select app.check_cost(1000000000001)$$, 'P0001', 'COST_INVALID', 'cost above 10^12 is refused');
+select is(app.check_cost(null), null::numeric, 'null cost still passes');
+select ok(not has_function_privilege('authenticated', 'app.check_quantity(numeric,boolean)', 'execute')
+      and not has_function_privilege('authenticated', 'app.check_cost(numeric)', 'execute')
+      and not has_function_privilege('anon', 'app.check_quantity(numeric,boolean)', 'execute')
+      and not has_function_privilege('anon', 'app.check_cost(numeric)', 'execute'), 'the helpers stay closed to clients');
+select test.act_as('201');
+select throws_ok($$select public.create_purchase('e7000000-0000-4000-8000-000000000990', 'S-01', '[{"item_id":"D-001","unit":"عبوة","quantity":"1e13"}]'::jsonb)$$, 'P0001', 'QUANTITY_INVALID', 'create_purchase quantity 1e13');
+select throws_ok($$select public.create_purchase('e7000000-0000-4000-8000-000000000990', 'S-01', '[{"item_id":"D-001","unit":"عبوة","quantity":1,"cost_total":"1e13"}]'::jsonb)$$, 'P0001', 'COST_INVALID', 'create_purchase cost 1e13');
+select test.act_as('100');
+select throws_ok($$select public.edit_purchase_line('e7000000-0000-4000-8000-000000000990', t7.lid('e7000000-0000-4000-8000-000000000711'), '1e13', 'عبوة', null)$$, 'P0001', 'QUANTITY_INVALID', 'edit_purchase_line quantity 1e13');
+select test.reset_role();
+
+-- 19f. transfer RPCs (0007, unchanged) are protected by the same bounds ----------------------
+select count(*) as n0 from transfers \gset
+select test.act_as('301');
+select throws_ok($$select public.send_transfer('e7000000-0000-4000-8000-000000000990', 'BR-01', '[{"item_id":"D-001","unit":"كرتونة","quantity":"1e131070","cost_total":5}]'::jsonb)$$, 'P0001', 'QUANTITY_INVALID', 'send_transfer quantity 1e131070 is QUANTITY_INVALID, not 22003');
+select throws_ok($$select public.send_transfer('e7000000-0000-4000-8000-000000000990', 'BR-01', '[{"item_id":"D-001","unit":"كرتونة","quantity":"1e13","cost_total":5}]'::jsonb)$$, 'P0001', 'QUANTITY_INVALID', 'send_transfer quantity 1e13');
+select test.reset_role();
+select is((select count(*) from transfers), :n0::bigint, 'the refused sends wrote no transfer');
+select is((select count(*) from stock_movements where kind = 'transfer_out'), 0::bigint, 'and no movement');
+select test.act_as('301');
+select lives_ok($$select public.send_transfer('e7000000-0000-4000-8000-000000000991', 'BR-01', '[{"item_id":"D-001","unit":"عبوة","quantity":1,"cost_total":5}]'::jsonb)$$, 'a normal send for the receive check');
+select test.act_as('201');
+select throws_ok($$select public.receive_transfer('e7000000-0000-4000-8000-000000000990', (select id from transfers where request_id = 'e7000000-0000-4000-8000-000000000991'),
+  jsonb_build_array(jsonb_build_object('line_id', (select l.id from transfer_lines l join transfers t on t.id = l.transfer_id where t.request_id = 'e7000000-0000-4000-8000-000000000991'),
+                                       'quantity', 1e13::numeric, 'unit', 'عبوة')))$$, 'P0001', 'QUANTITY_INVALID', 'receive_transfer received quantity 1e13');
+select test.reset_role();
+select is((select status from transfer_lines l join transfers t on t.id = l.transfer_id where t.request_id = 'e7000000-0000-4000-8000-000000000991'), 'pending', 'the refused receipt left the line pending');
 
 -- 20. activity log: one row per successful call, none on failure ----------------------------
 select is((select count(*) from activity_log where action = 'create_purchase'), (select count(*) from purchases), 'one create_purchase log row per purchase');

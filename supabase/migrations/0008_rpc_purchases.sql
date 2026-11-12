@@ -5,6 +5,35 @@
 -- (at the purchase's created_at) and are allowed while the branch is frozen.
 -- No function here reads the balances view: balances are shown, never used to block.
 
+-- Hardening of 0005 helpers (follow-up; 0005 itself is not edited).
+-- Same signatures, attributes and behaviour as in 0005, plus one rule each: a value above 10^12 is
+-- refused. Every quantity and cost any RPC accepts goes through these two helpers, so bounding them
+-- keeps "quantity x rate" far from numeric overflow (SQLSTATE 22003) in all RPCs at once, including
+-- the frozen transfer RPCs. create or replace keeps the existing (closed) privileges.
+create or replace function app.check_quantity(p_quantity numeric, p_allow_zero boolean) returns numeric
+language plpgsql security definer
+set search_path = app, public, extensions, pg_temp as $$
+begin
+  if p_quantity is null or not app.is_finite(p_quantity)
+     or p_quantity < 0 or (p_quantity = 0 and not coalesce(p_allow_zero, false))
+     or p_quantity > 1000000000000 then
+    raise exception 'QUANTITY_INVALID';
+  end if;
+  return p_quantity;
+end;
+$$;
+
+create or replace function app.check_cost(p_cost numeric) returns numeric
+language plpgsql security definer
+set search_path = app, public, extensions, pg_temp as $$
+begin
+  if p_cost is not null and (not app.is_finite(p_cost) or p_cost < 0 or p_cost > 1000000000000) then
+    raise exception 'COST_INVALID';
+  end if;
+  return p_cost;
+end;
+$$;
+
 -- Internal, shared by edit and void: changes ONE purchase line. The line row lock is the first thing
 -- taken; every value the change is based on is read after it. Unknown line -> FORBIDDEN (existence is
 -- not revealed, same convention as an unknown transfer); voided line -> LINE_VOIDED.
@@ -27,6 +56,9 @@ declare
   v_rate     numeric;
   v_new_base numeric;
 begin
+  if p_action is null or p_action not in ('edit', 'void') then
+    raise exception 'FORBIDDEN';
+  end if;
   select l.* into v_line from purchase_lines l where l.id = p_line_id for update;
   if v_line.id is null then
     raise exception 'FORBIDDEN';
@@ -196,6 +228,9 @@ begin
   end if;
 
   perform app.purchase_line_change(p_line_id, 'edit', v_qty, p_unit, v_cost, v_user.id);
+
+  -- A no-op edit (nothing changed) writes no history and no movement, but it is still a call: it is
+  -- logged and its request id is stored (the activity log records calls, not only changes).
 
   v_result := jsonb_build_object('line_id', p_line_id);
   perform app.log_action(v_user.id, 'edit_purchase_line', 'purchase_lines', p_line_id::text,
