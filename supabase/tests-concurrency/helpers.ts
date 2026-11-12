@@ -39,3 +39,26 @@ export function connect(): Conn {
   };
   return postgres(options as unknown as postgres.Options<Record<string, never>>);
 }
+
+/** The server process id of a connection. */
+export async function backendPid(c: Conn): Promise<number> {
+  const rows = await c.unsafe("select pg_backend_pid() as pid");
+  return Number((rows[0] as unknown as { pid: number }).pid);
+}
+
+/**
+ * Polls pg_stat_activity (through `admin`, a third connection) until backend `pid`
+ * is waiting for a lock. Fails after `timeoutMs` if it never blocks, so a test can
+ * assert that a statement really waited instead of guessing with a sleep.
+ */
+export async function waitUntilBlocked(admin: Conn, pid: number, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await admin.unsafe(
+      `select 1 from pg_stat_activity where pid = ${Number(pid)} and wait_event_type = 'Lock'`,
+    );
+    if (rows.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`backend ${pid} was never blocked on a lock within ${timeoutMs} ms`);
+}

@@ -8,7 +8,7 @@
 // both checks pass and both transactions commit; with it the second check waits
 // for the first transaction to finish and then sees its committed change.
 import { assert, assertEquals } from "jsr:@std/assert@1.0.13";
-import { type Conn, connect } from "./helpers.ts";
+import { backendPid, type Conn, connect, waitUntilBlocked } from "./helpers.ts";
 
 const BASE = "مل";
 const OTHER = "لتر";
@@ -24,15 +24,6 @@ async function run(c: Conn, query: string): Promise<Outcome> {
     const err = e as { code?: string; message?: string };
     return { code: err.code ?? null, message: err.message ?? String(e) };
   }
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Gives a blocked statement time to show it is blocked; the answer is not used for assertions. */
-async function pause() {
-  await sleep(400);
 }
 
 async function createItem(c: Conn, id: string) {
@@ -54,17 +45,19 @@ async function dropItem(c: Conn, id: string) {
     commit;`);
 }
 
-/** Runs body with two connections and one fresh item; always cleans up. */
-async function withItem(
-  id: string,
-  body: (a: Conn, b: Conn, id: string) => Promise<void>,
-) {
+type Ctx = { a: Conn; b: Conn; id: string; pidA: number; pidB: number; admin: Conn };
+
+/** Runs body with two transaction connections, an observer and one fresh item; always cleans up. */
+async function withItem(id: string, body: (ctx: Ctx) => Promise<void>) {
   const a = connect();
   const b = connect();
+  const admin = connect();
   try {
+    const pidA = await backendPid(a);
+    const pidB = await backendPid(b);
     await createItem(a, id);
     try {
-      await body(a, b, id);
+      await body({ a, b, id, pidA, pidB, admin });
     } finally {
       await run(a, "rollback");
       await run(b, "rollback");
@@ -73,6 +66,7 @@ async function withItem(
   } finally {
     await a.end({ timeout: 5 });
     await b.end({ timeout: 5 });
+    await admin.end({ timeout: 5 });
   }
 }
 
@@ -100,7 +94,7 @@ function assertRefused(o: Outcome, what: string) {
  * A repoints the item's base unit to OTHER. B changes OTHER while A is still open
  * (B started after A's update). A finishes first; B must be the one refused.
  */
-async function aFirst(id: string, a: Conn, b: Conn, bChange: string) {
+async function aFirst({ a, b, id, pidB, admin }: Ctx, bChange: string) {
   await a.unsafe("begin");
   await b.unsafe("begin");
   assertEquals(await run(a, `update items set base_unit = '${OTHER}' where id = '${id}'`), null);
@@ -109,7 +103,7 @@ async function aFirst(id: string, a: Conn, b: Conn, bChange: string) {
   assertEquals(await run(a, "set constraints all immediate"), null);
   // B's check runs while A is still open. With the lock it waits for A.
   const bCheck = run(b, "set constraints all immediate");
-  await pause();
+  await waitUntilBlocked(admin, pidB); // B really waits for A
   assertEquals(await run(a, "commit"), null, "A commits first");
   const failures = [await bCheck];
   failures.push(await run(b, "commit"));
@@ -120,12 +114,12 @@ async function aFirst(id: string, a: Conn, b: Conn, bChange: string) {
 }
 
 Deno.test("repoint vs rate change: the rate change is refused", async () => {
-  await withItem("D-901", (a, b, id) =>
-    aFirst(id, a, b, `update item_units set conversion_rate = 1000 where item_id = '${id}' and unit_name = '${OTHER}'`));
+  await withItem("D-901", (ctx) =>
+    aFirst(ctx, `update item_units set conversion_rate = 1000 where item_id = '${ctx.id}' and unit_name = '${OTHER}'`));
 });
 
 Deno.test("rate change vs repoint: the later commit is refused", async () => {
-  await withItem("D-902", async (a, b, id) => {
+  await withItem("D-902", async ({ a, b, id, pidA, admin }) => {
     await b.unsafe("begin");
     await a.unsafe("begin");
     assertEquals(
@@ -140,7 +134,7 @@ Deno.test("rate change vs repoint: the later commit is refused", async () => {
       if (upd) return upd;
       return await run(a, "set constraints all immediate");
     })();
-    await pause();
+    await waitUntilBlocked(admin, pidA); // A's update really waits for B
     assertEquals(await run(b, "commit"), null, "B commits first");
     const failures = [await aSteps];
     failures.push(await run(a, "commit"));
@@ -152,8 +146,8 @@ Deno.test("rate change vs repoint: the later commit is refused", async () => {
 });
 
 Deno.test("repoint vs deactivate: the deactivation is refused", async () => {
-  await withItem("D-903", (a, b, id) =>
-    aFirst(id, a, b, `update item_units set active = false where item_id = '${id}' and unit_name = '${OTHER}'`));
+  await withItem("D-903", (ctx) =>
+    aFirst(ctx, `update item_units set active = false where item_id = '${ctx.id}' and unit_name = '${OTHER}'`));
 });
 
 Deno.test("control: changes to two different items both commit", async () => {

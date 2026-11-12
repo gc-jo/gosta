@@ -1,5 +1,9 @@
 -- Hardening of the reference schema (0001 is frozen; changes land here).
 
+-- Deliberately neither security definer nor given a search_path: it is a pure
+-- expression and must stay inlinable. Check constraints call it as whichever role
+-- writes the row, so that role needs execute (granted below). Likewise
+-- app.forbid_update_delete (0004) is deliberately not security definer: it only raises.
 -- True for every ordinary number, false for NaN, Infinity and -Infinity,
 -- null for null (so a check using it passes on null, like any check).
 create function app.is_finite(p_value numeric) returns boolean
@@ -7,16 +11,20 @@ language sql immutable as $$
   select p_value - p_value = 0
 $$;
 
+grant execute on function app.is_finite(numeric) to service_role;
+
 alter table item_units
   add constraint item_units_conversion_rate_finite check (app.is_finite(conversion_rate));
 
 -- Same rule as in 0001, now safe under concurrency. The rule is checked per
 -- transaction at commit, so two transactions that are each valid alone could
 -- together break it (one repoints items.base_unit to another rate-1 unit while
--- the other changes that unit's rate). Locking the item row first makes the second
+-- the other changes that unit's rate). Locking the item row first (for no key update:
+-- it conflicts with the update of items.base_unit, but not with foreign-key checks) makes the second
 -- transaction wait; once it resumes, its check sees the first one's committed change.
 create or replace function app.check_item_base_unit() returns trigger
 language plpgsql
+security definer
 set search_path = app, public, extensions, pg_temp as $$
 declare
   v_key     text := case tg_table_name when 'items' then 'id' else 'item_id' end;
@@ -33,7 +41,7 @@ begin
     where x is not null
     order by x
   loop
-    perform 1 from public.items i where i.id = v_item_id for update;
+    perform 1 from public.items i where i.id = v_item_id for no key update;
     if exists (select 1 from public.items i where i.id = v_item_id)
        and not exists (
          select 1

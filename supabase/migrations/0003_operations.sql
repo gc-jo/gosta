@@ -37,6 +37,7 @@ create table transfer_lines (
   constraint transfer_lines_base_quantity_product check (base_quantity = quantity * unit_rate),
   constraint transfer_lines_cost_total_not_negative check (cost_total >= 0),
   constraint transfer_lines_received_quantity_not_negative check (received_quantity >= 0),
+  constraint transfer_lines_received_unit_rate_positive check (received_unit_rate > 0),
   constraint transfer_lines_status_valid check (status in ('pending', 'received', 'denied')),
   constraint transfer_lines_diff_reason_valid
     check (diff_reason in ('overloaded', 'count_error', 'not_loaded')),
@@ -46,10 +47,9 @@ create table transfer_lines (
         received_quantity is not null and received_unit is not null
         and received_unit_rate is not null and received_base_quantity is not null
         and received_base_quantity = received_quantity * received_unit_rate
-      when 'pending' then
+      else  -- pending and denied
         received_quantity is null and received_unit is null
         and received_unit_rate is null and received_base_quantity is null
-      else true
     end),
   constraint transfer_lines_quantity_finite check (app.is_finite(quantity)),
   constraint transfer_lines_unit_rate_finite check (app.is_finite(unit_rate)),
@@ -117,7 +117,7 @@ create table count_windows (
   closed_at    timestamptz null,
   constraint count_windows_pk primary key (branch_id, period_month),
   constraint count_windows_period_month_first_day
-    check (period_month = date_trunc('month', period_month)::date),
+    check (extract(day from period_month) = 1),
   constraint count_windows_status_valid check (status in ('open', 'closed'))
 );
 
@@ -135,7 +135,7 @@ create table counts (
   revision     int not null default 0,
   constraint counts_branch_period_key unique (branch_id, period_month),
   constraint counts_period_month_first_day
-    check (period_month = date_trunc('month', period_month)::date),
+    check (extract(day from period_month) = 1),
   constraint counts_status_valid check (status in ('draft', 'submitted', 'returned', 'approved')),
   constraint counts_frozen_only_while_open
     check (frozen_since is null or status in ('draft', 'returned'))
@@ -153,5 +153,6 @@ create table count_lines (
   constraint count_lines_pk primary key (count_id, item_id),
   constraint count_lines_state_valid check (state in ('uncounted', 'counted', 'none')),
   constraint count_lines_uncounted_has_no_quantity check ((state = 'uncounted') = (base_quantity is null)),
+  constraint count_lines_base_quantity_not_negative check (base_quantity >= 0),
   constraint count_lines_base_quantity_finite check (app.is_finite(base_quantity))
 );

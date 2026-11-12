@@ -137,7 +137,8 @@ $$;
 
 -- Balance as the table owner (0 when the view has no row for the pair).
 create function test.balance(p_branch text, p_item text) returns numeric
-language sql stable as $$
+language sql stable
+security definer set search_path = app, public, extensions, pg_temp as $$
   select coalesce((select base_quantity from public.balances
                    where branch_id = p_branch and item_id = p_item), 0)
 $$;
@@ -145,7 +146,8 @@ $$;
 -- Open the current month's (Asia/Amman) count window for a branch and
 -- freeze it with a draft count. Idempotent.
 create function test.freeze(p_branch text) returns void
-language plpgsql as $$
+language plpgsql
+security definer set search_path = app, public, extensions, pg_temp as $$
 declare
   v_month date := date_trunc('month', now() at time zone 'Asia/Amman')::date;
   v_owner uuid := (select id from public.app_users where employee_number = '100');

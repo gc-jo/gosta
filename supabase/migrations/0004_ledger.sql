@@ -2,6 +2,7 @@
 -- RLS and grants come later.
 
 -- Raises the code IMMUTABLE_ROW (SQLSTATE P0001, like every other error code).
+-- Row triggers do not fire on TRUNCATE, so each table also gets a statement trigger.
 create function app.forbid_update_delete() returns trigger
 language plpgsql
 set search_path = app, public, extensions, pg_temp as $$
@@ -31,10 +32,14 @@ create index stock_movements_branch_item_occurred_idx
 create trigger stock_movements_insert_only
   before update or delete on stock_movements
   for each row execute function app.forbid_update_delete();
+create trigger stock_movements_no_truncate
+  before truncate on stock_movements
+  for each statement execute function app.forbid_update_delete();
 
 -- stock_baselines --------------------------------------------------------
 create table stock_baselines (
   id            uuid primary key default gen_random_uuid(),
+  seq           bigint generated always as identity,  -- write order; breaks effective_at ties
   branch_id     text not null references branches (id),
   item_id       text not null references items (id),
   base_quantity numeric not null,
@@ -43,6 +48,7 @@ create table stock_baselines (
   ref_id        uuid null,
   created_by    uuid null references app_users (id),
   constraint stock_baselines_source_valid check (source in ('count', 'owner_zero')),
+  constraint stock_baselines_base_quantity_not_negative check (base_quantity >= 0),
   constraint stock_baselines_base_quantity_finite check (app.is_finite(base_quantity))
 );
 create index stock_baselines_branch_item_effective_idx
@@ -50,6 +56,9 @@ create index stock_baselines_branch_item_effective_idx
 create trigger stock_baselines_insert_only
   before update or delete on stock_baselines
   for each row execute function app.forbid_update_delete();
+create trigger stock_baselines_no_truncate
+  before truncate on stock_baselines
+  for each statement execute function app.forbid_update_delete();
 
 -- activity_log -----------------------------------------------------------
 create table activity_log (
@@ -65,10 +74,16 @@ create table activity_log (
 create trigger activity_log_insert_only
   before update or delete on activity_log
   for each row execute function app.forbid_update_delete();
+create trigger activity_log_no_truncate
+  before truncate on activity_log
+  for each statement execute function app.forbid_update_delete();
 
 create trigger purchase_line_history_insert_only
   before update or delete on purchase_line_history
   for each row execute function app.forbid_update_delete();
+create trigger purchase_line_history_no_truncate
+  before truncate on purchase_line_history
+  for each statement execute function app.forbid_update_delete();
 
 -- rpc_requests -----------------------------------------------------------
 create table rpc_requests (
@@ -86,7 +101,7 @@ create table rpc_requests (
 -- base_quantity = latest baseline's quantity (0 if none)
 --               + sum of movements occurring after that baseline's effective_at
 --                 (all movements when there is no baseline)
--- "latest" = greatest effective_at, ties broken by greatest id
+-- "latest" = greatest effective_at, ties broken by greatest seq (latest written)
 create view balances with (security_invoker = true) as
 select b.id as branch_id,
        i.id as item_id,
@@ -103,7 +118,7 @@ left join lateral (
   select s.base_quantity, s.effective_at
   from stock_baselines s
   where s.branch_id = b.id and s.item_id = i.id
-  order by s.effective_at desc, s.id desc
+  order by s.effective_at desc, s.seq desc
   limit 1
 ) bl on true
 where b.active and i.active;

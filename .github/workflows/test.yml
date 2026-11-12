@@ -16,5 +16,5 @@ jobs:
       - uses: denoland/setup-deno@v2
       - run: supabase db start
       - run: supabase test db
-      - run: deno test --allow-net=127.0.0.1:54322 --allow-env --allow-read --allow-sys supabase/tests-concurrency/
+      - run: deno test --allow-net=127.0.0.1:54322 --allow-env=DATABASE_URL --allow-read supabase/tests-concurrency/
       - run: deno test --permit-no-files supabase/functions/
