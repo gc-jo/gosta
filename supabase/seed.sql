@@ -61,15 +61,19 @@ insert into seed_users values
   ('215', 'مدير التالف', 'manager',     'BR-15', '1515', true),
   ('299', 'مدير موقوف', 'manager',     'BR-01', '9999', false);
 
--- String token columns are set to '' (not NULL) so GoTrue can read the rows.
+-- GoTrue must be able to load these rows (the login function signs them in): string token columns are ''
+-- (not NULL), and created_at / updated_at are set because GoTrue cannot scan a NULL timestamp
+-- ("Database error loading user" otherwise). Found by the login integration test on the real stack.
 insert into auth.users (
   instance_id, id, aud, role, email, email_confirmed_at,
-  confirmation_token, recovery_token, email_change, email_change_token_new, reauthentication_token
+  confirmation_token, recovery_token, email_change, email_change_token_new, reauthentication_token,
+  created_at, updated_at, raw_app_meta_data, raw_user_meta_data
 )
 select '00000000-0000-0000-0000-000000000000'::uuid,
        ('b0000000-0000-4000-8000-' || lpad(emp, 12, '0'))::uuid,
        'authenticated', 'authenticated', emp || '@gosta.invalid', now(),
-       '', '', '', '', ''
+       '', '', '', '', '',
+       now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb
 from seed_users;
 
 insert into app_users (auth_user_id, employee_number, name, role, branch_id, active)
