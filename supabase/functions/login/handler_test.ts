@@ -76,9 +76,23 @@ Deno.test("an already-registered Auth user is not a failure", async () => {
   });
   assertEquals(r.status, 200);
 });
-Deno.test("another createUser error is a 500 with no detail", async () => {
-  const r = await run({ create: { error: { status: 500, code: "x", message: "boom" } }, rpc: { login_verify: verify(null) }, signin: [] });
+Deno.test("a createUser error is survivable when the attach finds the Auth user (lost insert race)", async () => {
+  const r = await run({
+    create: { error: { status: 500, code: "unexpected_failure", message: "Database error creating new user" } },
+    rpc: { login_verify: verify(null), login_attach_auth_user: { data: "a1", error: null }, ...ok },
+    signin: [session],
+  });
+  assertEquals(r.status, 200);
+  assertEquals(r.calls, ["login_verify", "create", "login_attach_auth_user", "update", "signin", "login_register_session"]);
+});
+Deno.test("a createUser error with nothing to attach is a 500 with no detail (attach retried once)", async () => {
+  const r = await run({
+    create: { error: { status: 500, code: "x", message: "boom" } },
+    rpc: { login_verify: verify(null), login_attach_auth_user: { data: null, error: null } },
+    signin: [],
+  });
   assertEquals([r.status, r.text], [500, '{"error":"SERVER_ERROR"}']);
+  assertEquals(r.calls, ["login_verify", "create", "login_attach_auth_user", "login_attach_auth_user"]);
 });
 Deno.test("attach returning null is a 500", async () => {
   const r = await run({ rpc: { login_verify: verify(null), login_attach_auth_user: { data: null, error: null } }, signin: [] });

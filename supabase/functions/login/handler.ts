@@ -95,9 +95,19 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
     let passwordSet = false;
     if (!authId) {
       const created = await admin.createUser({ email, password: derived, email_confirm: true });
-      if (created.error && !isAlreadyRegistered(created.error)) return fail(cfg, "createUser failed", created.error);
-      const att = await deps.service.rpc("login_attach_auth_user", { p_user_id: userId });
-      if (att.error || !att.data || typeof att.data !== "string") return fail(cfg, "attach failed");
+      // GoTrue answers "already registered" when it finds the user first, but a simultaneous first login that
+      // loses the insert race gets a database error instead. Either way the attach below is the truth: it finds
+      // the Auth user by email, or it does not and we fail.
+      const createFailed = !!created.error && !isAlreadyRegistered(created.error);
+      const attach = () => deps.service.rpc("login_attach_auth_user", { p_user_id: userId });
+      let att = await attach();
+      if (createFailed && (att.error || !att.data)) {
+        await new Promise((r) => setTimeout(r, 300)); // the winner of the race may still be committing
+        att = await attach();
+      }
+      if (att.error || !att.data || typeof att.data !== "string") {
+        return fail(cfg, createFailed ? "createUser failed" : "attach failed", createFailed ? created.error : undefined);
+      }
       authId = att.data;
       // 3. an Auth user found by email is trusted only once its password is ours
       const upd = await admin.updateUserById(authId, { password: derived });
