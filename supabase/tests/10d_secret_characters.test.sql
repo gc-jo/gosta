@@ -81,12 +81,12 @@ select is(t13.lv('100', 'correct horse ' || chr(128512) || 'battery'), 'invalid'
 create function t13.crypt_delta(p_secret text) returns setof text language plpgsql as $$
 declare v_before bigint;
 begin
+  v_before := t13.crypt_calls();
+  perform public.login_verify('203', p_secret);   -- always performed: later assertions count its side effects
   if current_setting('t13.track', true) is distinct from '1' then
     return next skip(1, 'this role cannot set track_functions');
     return;
   end if;
-  v_before := t13.crypt_calls();
-  perform public.login_verify('203', p_secret);
   return next is(t13.crypt_calls() - v_before, 1::bigint, 'a control-character secret runs exactly one crypt call');
 end;
 $$;
