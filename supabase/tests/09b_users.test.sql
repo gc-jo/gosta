@@ -103,7 +103,7 @@ select throws_ok($$select app.clean_secret('manager', '12a4')$$, 'P0001', 'SECRE
 select throws_ok($$select app.clean_secret('manager', '')$$, 'P0001', 'SECRET_WEAK', 'empty');
 select throws_ok($$select app.clean_secret('manager', null)$$, 'P0001', 'SECRET_WEAK', 'null');
 select throws_ok($$select app.clean_secret('manager', ' 1111')$$, 'P0001', 'SECRET_WEAK', 'leading space is not trimmed');
-select throws_ok($$select app.clean_secret('manager', E'1111\n')$$, 'P0001', 'SECRET_WEAK', 'trailing newline');
+select throws_ok($$select app.clean_secret('manager', E'1111\n')$$, 'P0001', 'SECRET_INVALID', 'trailing newline (a control character; SECRET_WEAK before migration 0013)');
 select throws_ok($$select app.clean_secret('manager', repeat('1', 200))$$, 'P0001', 'SECRET_WEAK', 'a 200-digit staff PIN is weak (the 4-digit rule bounds it)');
 select throws_ok($$select app.clean_secret('owner', 'short')$$, 'P0001', 'SECRET_WEAK', 'owner: short');
 select throws_ok($$select app.clean_secret('owner', 'elevenchars')$$, 'P0001', 'SECRET_WEAK', 'owner: 11 characters');
