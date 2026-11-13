@@ -5,6 +5,17 @@ export function checkDeriveSecret(secret: string | undefined | null): boolean {
   return typeof secret === "string" && secret.length >= 32;
 }
 
+/** True when APP_ORIGIN is a plain http(s) origin (scheme://host[:port], nothing else). */
+export function checkAppOrigin(origin: string | undefined | null): boolean {
+  if (typeof origin !== "string" || origin === "") return false;
+  try {
+    const u = new URL(origin);
+    return (u.protocol === "https:" || u.protocol === "http:") && u.origin === origin;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The Supabase Auth password of an app user: lowercase hex HMAC-SHA-256 of the app user id, keyed by the
  * server-only derive secret. The client never sees it; it is never the PIN.

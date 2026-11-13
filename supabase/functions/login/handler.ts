@@ -2,7 +2,7 @@
 // The database decides who may log in (login_verify) and which sessions count (login_register_session);
 // this function only turns a verified login into an Auth session. See spec section 5.
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2.49.4";
-import { checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
+import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
 
 const MAX_BODY_BYTES = 1024;
 const EMAIL_DOMAIN = "gosta.invalid";
@@ -36,12 +36,41 @@ const fail = (c: LoginConfig, tag: string, err?: { status?: number; code?: strin
   return respond(c, 500, { error: "SERVER_ERROR" });
 };
 
-/** Reads and validates the body; null when it is not acceptable. */
-async function readBody(req: Request): Promise<{ employee_number: string; secret: string } | null> {
+/** Reads the body with a running byte cap; null when it is over the cap. A lying Content-Length changes nothing. */
+async function readCapped(req: Request): Promise<string | null> {
   const declared = Number(req.headers.get("content-length") ?? "0");
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return null;
-  const text = await req.text();
-  if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) return null;
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) (all.set(c, off), off += c.byteLength);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(all);
+  } catch {
+    return null;
+  }
+}
+
+// C0 controls (NUL included), DEL and C1 controls never belong in an employee number or a secret
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** Reads and validates the body; null when it is not acceptable. */
+async function readBody(req: Request): Promise<{ employee_number: string; secret: string } | null> {
+  const text = await readCapped(req);
+  if (text === null) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -51,6 +80,7 @@ async function readBody(req: Request): Promise<{ employee_number: string; secret
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
   const { employee_number, secret } = parsed as Record<string, unknown>;
   if (typeof employee_number !== "string" || typeof secret !== "string") return null;
+  if (CONTROL.test(employee_number) || CONTROL.test(secret)) return null;
   return { employee_number, secret };
 }
 
@@ -62,6 +92,7 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
   const cfg = deps.config;
   const deriveSecret = cfg.deriveSecret;
   if (!checkDeriveSecret(deriveSecret)) return fail(cfg, "derive secret missing or too short");
+  if (!checkAppOrigin(cfg.appOrigin)) return fail(cfg, "APP_ORIGIN missing or not an origin");
   if (req.method === "OPTIONS") return respond(cfg, 204);
   if (req.method !== "POST") return respond(cfg, 405, { error: "BAD_REQUEST" });
 
@@ -90,6 +121,11 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
     const derived = await deriveAuthPassword(deriveSecret!, userId);
     const admin = deps.service.auth.admin;
 
+    // The invariant for an attached Auth user: its email is <employee_number>@gosta.invalid and its password is
+    // the derived one. One helper establishes both (the number can change in the database, the password can be
+    // foreign or from an old derive secret).
+    const establish = (id: string) => admin.updateUserById(id, { password: derived, email, email_confirm: true });
+
     // 2. provision the Auth user on first login (resumable, safe against a simultaneous first login)
     let authId = v.auth_user_id ?? null;
     let passwordSet = false;
@@ -110,8 +146,8 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
       }
       authId = att.data;
       // 3. an Auth user found by email is trusted only once its password is ours
-      const upd = await admin.updateUserById(authId, { password: derived });
-      if (upd.error) return fail(cfg, "password set failed", upd.error);
+      const upd = await establish(authId);
+      if (upd.error) return fail(cfg, "auth user update failed (first login)", upd.error);
       passwordSet = true;
     }
 
@@ -120,8 +156,8 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
     let res = await signIn();
     if (res.error || !res.data.session) {
       if (passwordSet) return fail(cfg, "sign-in failed", res.error ?? undefined);
-      const upd = await admin.updateUserById(authId, { password: derived });
-      if (upd.error) return fail(cfg, "password repair failed", upd.error);
+      const upd = await establish(authId);
+      if (upd.error) return fail(cfg, "auth user repair failed (email or password)", upd.error);
       res = await signIn();
       if (res.error || !res.data.session) return fail(cfg, "sign-in failed after repair", res.error ?? undefined);
     }
@@ -156,7 +192,10 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
 
     // 6. the session and the user's profile (app user id, not the Auth id)
     const prof = await deps.service.from("app_users").select("id, name, role, branch_id").eq("id", userId).single();
-    if (prof.error || !prof.data) return fail(cfg, "profile read failed");
+    if (prof.error || !prof.data) {
+      await dropSession(); // the app_sessions row cannot be revoked from here; sign-out only
+      return fail(cfg, "profile read failed");
+    }
     return respond(cfg, 200, {
       access_token: session.access_token,
       refresh_token: session.refresh_token,

@@ -3,12 +3,18 @@
 //
 // Needs: `supabase start`, `supabase functions serve --env-file supabase/functions/.env.ci`, and in this
 // process SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, AUTH_DERIVE_SECRET, APP_ORIGIN.
-// Run: deno test --allow-net=127.0.0.1 --allow-env=SUPABASE_URL,SUPABASE_ANON_KEY,SUPABASE_SERVICE_ROLE_KEY,AUTH_DERIVE_SECRET,APP_ORIGIN
+// Run: deno test --allow-net=127.0.0.1 --allow-env=SUPABASE_URL,SUPABASE_ANON_KEY,SUPABASE_SERVICE_ROLE_KEY,AUTH_DERIVE_SECRET,APP_ORIGIN,DATABASE_URL
+//
+// WARNING: this test COMMITS users, sessions, transfers and Auth users in the local stack. Run it last, and run
+// `supabase db reset` before running the pgTAP suite again locally afterwards (CI runs pgTAP first).
+// Extra env: DATABASE_URL (only for test 15, which changes an employee number directly in the database, as the
+// owner-recovery runbook does; defaults to the local stack's 127.0.0.1:54322).
 //
 // Seeded users (100, 201, 202, 203, 301, 215) are only used for plain logins; everything that resets,
 // locks or deactivates uses a user created here. Test 12 (no leakage) must stay last.
 import { assert, assertEquals, assertMatch, assertNotEquals } from "jsr:@std/assert@1.0.13";
 import { deriveAuthPassword } from "./derive.ts";
+import { connect } from "../../tests-concurrency/helpers.ts";
 
 const need = (n: string) => {
   const v = Deno.env.get(n);
@@ -119,8 +125,8 @@ async function ownerToken(): Promise<string> {
 const RUN = String(Date.now()).slice(-7);
 let counter = 0;
 /** Creates a manager of BR-01 through the real admin RPC, as the owner. */
-async function makeUser(owner: string, pin: string, role = "manager", branch = "BR-01") {
-  const num = `8${RUN}${String(++counter).padStart(2, "0")}`;
+async function makeUser(owner: string, pin: string, role = "manager", branch = "BR-01", fixedNum?: string) {
+  const num = fixedNum ?? `8${RUN}${String(++counter).padStart(2, "0")}`;
   const r = await rpc("admin_create_user", owner, {
     p_request_id: rid(),
     p_employee_number: num,
@@ -189,16 +195,24 @@ Deno.test("4. interrupted provisioning: an unattached Auth user with a foreign p
   const owner = await ownerToken();
   const u = await makeUser(owner, "1357");
   const email = `${u.num}@gosta.invalid`;
+  const foreign = crypto.randomUUID() + crypto.randomUUID();
   const c = await http(`${BASE}/auth/v1/admin/users`, {
     method: "POST",
     headers: adminHeaders,
-    body: JSON.stringify({ email, password: crypto.randomUUID() + crypto.randomUUID(), email_confirm: true }),
+    body: JSON.stringify({ email, password: foreign, email_confirm: true }),
   });
   assert(c.status === 200 || c.status === 201, `admin createUser -> ${c.text.slice(0, 200)}`);
   const t = await loginOk(u.num, u.pin);
   assertEquals((await authUsersWithEmail(email)).length, 1);
   assertEquals((await appUser(u.num)).auth_user_id, c.json.id);
   await assertAlive("interrupted", t.access);
+  // the foreign password no longer works at GoTrue: the Auth user was taken over
+  const old = await http(`${BASE}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: ANON, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: foreign }),
+  });
+  assertEquals(old.status, 400, "the foreign password is dead");
 });
 
 // 5 ---------------------------------------------------------------------------------------------------
@@ -382,6 +396,44 @@ Deno.test("14. seeded users can still log in", async () => {
   for (const [n, s] of [["100", OWNER_PASSWORD], ["201", "1111"], ["202", "2222"], ["203", "0303"], ["301", "3333"], ["215", "1515"]]) {
     assertEquals((await login(n, s)).status, 200, `seeded ${n}`);
   }
+});
+
+// 15 --------------------------------------------------------------------------------------------------
+Deno.test("15. a changed employee number (runbook section 3): login works, the Auth email follows, the old number is reusable", async () => {
+  const owner = await ownerToken();
+  const u = await makeUser(owner, "6464");
+  const n1 = u.num;
+  const n2 = `7${RUN}${String(++counter).padStart(2, "0")}`;
+  assertEquals((await loginOk(n1, u.pin)).access.length > 0, true);
+  const before = await authUsersWithEmail(`${n1}@gosta.invalid`);
+  assertEquals(before.length, 1);
+  const authId = before[0].id;
+
+  const db = connect();
+  try {
+    await db.unsafe(`update app_users set employee_number = $2 where id = $1`, [u.id, n2]);
+  } finally {
+    await db.end();
+  }
+
+  const t = await loginOk(n2, u.pin);
+  await assertAlive("after number change", t.access);
+  const after = await authUsersWithEmail(`${n2}@gosta.invalid`);
+  assertEquals(after.length, 1, "exactly one Auth user for the new number");
+  assertEquals(after[0].id, authId, "it is the same Auth user, its email was updated");
+  assertEquals((await authUsersWithEmail(`${n1}@gosta.invalid`)).length, 0, "the old email is gone");
+  assertEquals((await login(n2, u.pin)).status, 200, "second login with the new number");
+  assertEquals((await login(n1, u.pin)).status, 401, "the old number no longer logs in");
+
+  // the old number is free for someone else
+  const u2 = await makeUser(owner, "6565", "manager", "BR-01", n1);
+  const t2 = await loginOk(n1, u2.pin);
+  await assertAlive("new holder of the old number", t2.access);
+  const mine = await authUsersWithEmail(`${n1}@gosta.invalid`);
+  assertEquals(mine.length, 1);
+  assertNotEquals(mine[0].id, authId, "a different Auth user");
+  assertEquals((await appUser(n1)).auth_user_id, mine[0].id);
+  assertEquals((await appUser(n2)).auth_user_id, authId);
 });
 
 // 12 (kept last) --------------------------------------------------------------------------------------

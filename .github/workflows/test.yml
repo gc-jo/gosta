@@ -37,9 +37,9 @@ jobs:
       - name: Login function tests
         run: |
           set -a; . "$RUNNER_TEMP/stack.env"; . supabase/functions/.env.ci; set +a
-          export SUPABASE_URL="$API_URL" SUPABASE_ANON_KEY="$ANON_KEY" SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY"
+          export SUPABASE_URL="$API_URL" SUPABASE_ANON_KEY="$ANON_KEY" SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY" DATABASE_URL="$DB_URL"
           deno test --allow-net=127.0.0.1 \
-            --allow-env=SUPABASE_URL,SUPABASE_ANON_KEY,SUPABASE_SERVICE_ROLE_KEY,AUTH_DERIVE_SECRET,APP_ORIGIN \
+            --allow-env=SUPABASE_URL,SUPABASE_ANON_KEY,SUPABASE_SERVICE_ROLE_KEY,AUTH_DERIVE_SECRET,APP_ORIGIN,DATABASE_URL \
             supabase/functions/
       - name: Functions log
         if: failure()

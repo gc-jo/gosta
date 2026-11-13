@@ -1,5 +1,5 @@
 import { assertEquals, assertMatch, assertNotEquals, assertThrows } from "jsr:@std/assert@1.0.13";
-import { checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
+import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
 
 Deno.test("deriveAuthPassword is deterministic, 64 hex chars, depends on both inputs", async () => {
   const a = await deriveAuthPassword("k1", "u1");
@@ -53,4 +53,11 @@ Deno.test("checkDeriveSecret fails closed on a missing or short secret", () => {
   assertEquals(checkDeriveSecret("x".repeat(31)), false);
   assertEquals(checkDeriveSecret("x".repeat(32)), true);
   assertEquals(checkDeriveSecret("x".repeat(64)), true);
+});
+
+Deno.test("checkAppOrigin accepts plain http(s) origins only", () => {
+  for (const ok of ["http://127.0.0.1:3000", "https://app.example.com", "https://a.b.c:8443"]) assertEquals(checkAppOrigin(ok), true, ok);
+  for (const no of [undefined, null, "", "*", "app.example.com", "https://app.example.com/", "https://app.example.com/path", "ftp://x.com", "javascript:alert(1)", "https://a.com, https://b.com"]) {
+    assertEquals(checkAppOrigin(no as string | undefined), false, String(no));
+  }
 });

@@ -4,13 +4,26 @@
 -- Everything runs as postgres, like the dashboard's SQL editor (which bypasses the app's access rules);
 -- the seeded owner is '100' with password 'correct horse battery'.
 begin;
-select plan(29);
+select plan(32);
 
 create schema t12c;
 create function t12c.owner_id() returns uuid language sql stable as $$ select id from app_users where role = 'owner' $$;
 create function t12c.live() returns bigint language sql stable as
 $$ select count(*) from app_sessions where user_id = t12c.owner_id() and revoked_at is null $$;
 create function t12c.cv() returns int language sql stable as $$ select credential_version from app_users where role = 'owner' $$;
+-- act as the owner's Auth user with an explicit session id, like 10b_owner_recheck.test.sql
+create function t12c.act_sess(p_session uuid) returns void language plpgsql as $$
+declare v_auth uuid;
+begin
+  reset role;
+  select auth_user_id into v_auth from app_users where role = 'owner';
+  perform set_config('request.jwt.claims',
+    jsonb_build_object('sub', v_auth, 'role', 'authenticated', 'session_id', p_session)::text, true);
+  set local role authenticated;
+end;
+$$;
+grant usage on schema t12c to authenticated;
+grant execute on all functions in schema t12c to authenticated;
 create function t12c.lv(p_emp text, p_secret text) returns text language sql as
 $$ select case when (r ->> 'ok')::boolean then 'ok' else r ->> 'reason' end from (select public.login_verify(p_emp, p_secret) as r) q $$;
 
@@ -46,7 +59,7 @@ insert into app_sessions (session_id, user_id, expires_at)
 values ('c0c0c0c0-0000-4000-8000-000000000001', t12c.owner_id(), clock_timestamp() + interval '7 days'),
        ('c0c0c0c0-0000-4000-8000-000000000002', t12c.owner_id(), clock_timestamp() + interval '7 days');
 select is(t12c.live(), 3::bigint, 'three live owner sessions before the reset');
-create table t12c.before as select t12c.cv() as cv;
+create table t12c.before as select t12c.cv() as cv, (select auth_user_id from app_users where role = 'owner') as auth_id;
 
 select lives_ok($q$
 update app_user_secrets
@@ -84,6 +97,12 @@ where role = 'owner';
 $q$, 'runbook 3: change the employee number');
 select is(t12c.lv('90001234', 'brand new owner pass 123'), 'ok', 'the owner logs in with the new number');
 select is(t12c.lv('100', 'brand new owner pass 123'), 'invalid', 'the old number no longer works');
-select is(t12c.live(), 1::bigint, 'existing sessions keep working');
+select is((select auth_user_id from app_users where role = 'owner'), (select auth_id from t12c.before), 'the statement left auth_user_id unchanged');
+select is(t12c.live(), 1::bigint, 'one live owner session exists (the one registered in section 2)');
+select t12c.act_sess('c0c0c0c0-0000-4000-8000-000000000004');
+select is((select app.session_ok()), true, 'that existing session still passes app.session_ok() after the number change');
+select t12c.act_sess('c0c0c0c0-0000-4000-8000-000000000001');
+select is((select app.session_ok()), false, 'a session revoked in section 2 stays refused (control)');
+reset role;
 select * from finish();
 rollback;
