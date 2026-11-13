@@ -25,11 +25,13 @@ This does not change the password and does not end any session.
 
 ## 2. Password lost
 
-Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain the four characters `$pw$` in a row.
+Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain the three characters `$pw` anywhere (they would end the quoting early; the block then stops with a syntax error and changes nothing). Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
 
 Type the new password **once**, in statement 2, between the two `$pw$` markers, replacing `PUT-NEW-PASSWORD-HERE`. Nothing between the markers needs escaping: quotes and backslashes are taken literally. Change nothing else.
 
-Run the whole block as one unit, exactly as written. It is a single transaction. Its first statement takes a lock on the owner's row; a login that was already under way with the old password waits on that lock and is refused when the block commits, and a login that had already finished is ended by statement 6. Do not run the statements one at a time and do not remove or move the first one: without it a login in progress can leave a working session behind.
+First run the check query shown after the block and note the owner's `credential_version`.
+
+Then run the whole block as one unit, exactly as written. It is a single transaction. Its first statement takes a lock on the owner's row. A login with the old password cannot get past the block: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended by statement 6. Do not run the statements one at a time and do not remove or move the first one: without it a login in progress can leave a working session behind.
 
 ```sql
 begin;
@@ -74,7 +76,7 @@ select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PA
 commit;
 ```
 
-**Seeing `COMMIT` is not proof.** If any statement reports an error (including a line starting with `STOP:`), the password was **not** changed: run `rollback;` and start again. After a run with no error, confirm it with this query:
+**Seeing `COMMIT` is not proof, and the editor may not show it at all.** If any statement reports an error (including a line starting with `STOP:`), the password was **not** changed: run `rollback;` and start again. Statement 2 shows the password back in its result; that is expected. Before the block, and again after a run with no error, run this check query:
 
 ```sql
 select employee_number,
@@ -85,7 +87,7 @@ from app_users u
 where role = 'owner';
 ```
 
-It must return exactly one row, with `live_sessions` = 0 and `credential_version` one higher than before. Then sign in to the app with the new password and **change it again from Settings straight away**: the password you typed is kept in the dashboard's query history, and a password the block refused may also appear in the database's error log.
+After the block it must return exactly one row, with `live_sessions` = 0 and `credential_version` exactly one higher than the value you noted before the block. If the version did not change, the block did not take effect, whatever the editor displayed. Then sign in to the app with the new password and **change it again from Settings straight away**: the password you typed is kept in the dashboard's query history and may be written to the database's statement and error logs, whether the block succeeded or not.
 
 What this does not touch: the owner's sign-ins at Supabase Auth itself are not ended. They are useless on their own, because every read and every action in the app checks the app's own session list, which statement 6 has just emptied. This holds as long as nothing is added to the project that trusts a Supabase Auth session without that check.
 
@@ -105,7 +107,7 @@ The statement above is all that is needed. The owner's Supabase Auth user still 
 
 ## What this runbook relies on
 
-- There is exactly one row with `role = 'owner'`. If the first query returns more than one row, stop and identify the right one by `employee_number`; replace `where role = 'owner'` with `where employee_number = '…'` in every statement.
+- There is exactly one row with `role = 'owner'`. Sections 1 and 3 act on every owner row; section 2 refuses to run unless there is exactly one. If the check query returns no row or more than one, stop: do not edit the statements to pick a row by number. That situation is outside this runbook and needs someone who can inspect the data first.
 - The statements are run as the dashboard's database role, which bypasses the app's access rules. Do not run anything else there.
 - **Not yet verified on a hosted project:** that the dashboard's SQL editor sends a pasted block as one request, and that its database role may call `app.clean_secret` and `app.log_action`. Both hold on the local stack used by the automated tests. Rehearse section 2 on the test project before launch (it is on the cutover checklist), and until then treat this procedure as tested locally only.
 - These exact statements are exercised by automated tests: `supabase/tests/10c_owner_recovery.test.sql`, and for section 2 a two-connection test (`supabase/tests-concurrency/owner_recovery_test.ts`) that reads the SQL block straight from this file and proves a login verified before the recovery cannot keep a session after it. If a statement here is changed, run both.
