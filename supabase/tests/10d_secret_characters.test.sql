@@ -1,7 +1,9 @@
 -- Migration 0013 / plan rule (ad): one rule for which characters a secret may contain. No control characters
 -- (Unicode category Cc: U+0000-U+001F and U+007F-U+009F) when a secret is set (app.clean_secret) and when it
--- is checked (public.login_verify). NUL (U+0000) cannot exist in a Postgres text value, so it is not tested here;
--- it is covered at the login function and through PostgREST in the Deno tests (JSON "\u0000" is refused there).
+-- is checked (public.login_verify). NUL (U+0000) cannot exist in a Postgres text value, so it is not tested here.
+-- Elsewhere: the login function rejects a NUL in a JSON body with 400 before any database call (handler_test.ts and the
+-- integration test 16c), and the integration test 16e records what PostgREST answers when admin_set_secret receives
+-- a secret containing \u0000.
 begin;
 select plan(46);
 
@@ -105,5 +107,7 @@ where user_id = (select id from app_users where role = 'owner');
 select is(t13.lv('100', 'legacy pass' || chr(9) || 'word!'), 'invalid', 'owner: a legacy hash of a control-character password is never matched');
 select is(t13.fa('215'), 1, 'the staff attempt was counted');
 select is(t13.fa('100'), 3, 'the owner attempt was counted (third wrong attempt since the last good login)');
+select diag('track_functions: 1 crypt-count assertion '
+            || case when current_setting('t13.track', true) = '1' then 'RAN' else 'was SKIPPED (this role cannot set track_functions)' end);
 select * from finish();
 rollback;

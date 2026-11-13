@@ -63,6 +63,21 @@ export async function waitUntilBlocked(admin: Conn, pid: number, timeoutMs = 500
   throw new Error(`backend ${pid} was never blocked on a lock within ${timeoutMs} ms`);
 }
 
+/** The backend pids that `pid` is waiting for (pg_blocking_pids), seen through `admin`. */
+export async function blockersOf(admin: Conn, pid: number): Promise<number[]> {
+  const rows = await admin.unsafe(`select unnest(pg_blocking_pids(${Number(pid)})) as b`);
+  return rows.map((r) => Number((r as unknown as { b: number }).b));
+}
+
+/** Like waitUntilBlocked, and then asserts that `expectedBlocker` is among the backends it waits for. */
+export async function waitUntilBlockedBy(admin: Conn, pid: number, expectedBlocker: number, timeoutMs = 5000): Promise<void> {
+  await waitUntilBlocked(admin, pid, timeoutMs);
+  const blockers = await blockersOf(admin, pid);
+  if (!blockers.includes(expectedBlocker)) {
+    throw new Error(`backend ${pid} waits for ${JSON.stringify(blockers)}, not for backend ${expectedBlocker}`);
+  }
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**

@@ -7,7 +7,7 @@
 // with autocommit and does the committed set-up and clean-up. The test commits real changes to the
 // owner's rows and restores them in `finally`; activity_log is insert-only, so its rows stay.
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1.0.13";
-import { actAsSession, backendPid, type Conn, connect, waitUntilBlocked } from "./helpers.ts";
+import { actAsSession, backendPid, type Conn, connect, waitUntilBlockedBy } from "./helpers.ts";
 
 const P2 = "second password P2 !!";
 const P3 = "third password P3 ??";
@@ -99,7 +99,7 @@ Deno.test("owner password: a session revoked while it waited for the row lock ca
     const bOutcome = b
       .unsafe(`select public.admin_set_secret($1, $2, $3)`, [reqB, owner.id, P3])
       .then(() => null as Error | null, (e: unknown) => e as Error);
-    await waitUntilBlocked(admin, pidB); // B really waits on a lock
+    await waitUntilBlockedBy(admin, pidB, await backendPid(a)); // B really waits, and for A specifically
 
     await a.unsafe("commit");
     const bError = await bOutcome;

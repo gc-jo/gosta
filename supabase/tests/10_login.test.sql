@@ -96,6 +96,7 @@ $$ select coalesce(sum(calls), 0)::bigint from pg_stat_xact_user_functions where
 create function t11.crypt_delta(p_desc text, p_emp text, p_secret text, p_expected bigint) returns setof text language plpgsql as $$
 declare v_before bigint; v_after bigint;
 begin
+  perform set_config('t11.crypt_n', (coalesce(nullif(current_setting('t11.crypt_n', true), ''), '0')::int + 1)::text, true);
   if current_setting('t11.track', true) is distinct from '1' then
     return next skip(1, 'this role cannot set track_functions');
     return;
@@ -432,5 +433,8 @@ select * from t11.crypt_delta('crypt count: wrong secret (real hash)', '203', '0
 select * from t11.crypt_delta('crypt count: right secret (real hash)', '203', '0303', 1);
 select * from t11.crypt_delta('crypt count: null number (dummy hash)', null, '0303', 1);
 
+-- visible in the CI log: did the crypt-count assertions run or were they skipped?
+select diag('track_functions: ' || coalesce(nullif(current_setting('t11.crypt_n', true), ''), '0') || ' crypt-count assertions '
+            || case when current_setting('t11.track', true) = '1' then 'RAN' else 'were SKIPPED (this role cannot set track_functions)' end);
 select * from finish();
 rollback;

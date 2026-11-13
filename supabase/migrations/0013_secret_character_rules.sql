@@ -89,7 +89,7 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'invalid', 'locked_until', null);
   end if;
 
-  -- Mirrors app.clean_secret (0010) by hand, without raising. The two MUST change together: staff secrets go
+  -- Mirrors app.clean_secret (as redefined above in 0013) by hand, without raising. The two MUST change together: staff secrets go
   -- through app.normalize_digits, an owner password is used exactly as typed, and the limit is 72 bytes
   -- (bcrypt reads no more). If clean_secret's rules change, change this block in the same migration.
   if p_secret is null then
