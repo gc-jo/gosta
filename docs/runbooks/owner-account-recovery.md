@@ -49,7 +49,7 @@ Run all three statements. Skipping the third leaves a login that started with th
 
 ## 3. Someone keeps locking the owner out
 
-The lock needs the owner's employee number. Give the owner a new one that is not guessable (digits only; leading zeros count):
+The lock needs the owner's employee number. Give the owner a new one that is not guessable. Type it in Latin digits `0`–`9` only (an Arabic-digit number stored here could never be matched at login); leading zeros count, and it must not already belong to another user:
 
 ```sql
 update app_users
@@ -57,7 +57,9 @@ set employee_number = 'PUT-NEW-NUMBER-HERE', failed_attempts = 0, locked_until =
 where role = 'owner';
 ```
 
-The owner then signs in with the new number and the same password. Existing sessions keep working. The Supabase Auth user attached to the account is unaffected.
+The owner then signs in with the new number and the same password. Existing sessions keep working.
+
+The statement above is all that is needed. The owner's Supabase Auth user still carries the old number in its internal email at this point; the login function notices on the owner's next sign-in and moves that email to the new number itself, which also frees the old number for reuse. Do not edit `auth.users` by hand. If that first sign-in with the new number fails with a server error, do not repeat the statement: check the function's log.
 
 ## What this runbook relies on
 
