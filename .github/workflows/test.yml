@@ -7,6 +7,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: supabase/setup-cli@v1
@@ -14,7 +15,32 @@ jobs:
           version: 3.1.0
       - run: supabase --version
       - uses: denoland/setup-deno@v2
-      - run: supabase db start
+      # Full stack (Auth, REST, gateway, edge runtime); services the tests do not need are left out.
+      - run: supabase start -x studio,imgproxy,mailpit,logflare,vector,realtime,storage-api,supavisor,postgres-meta
+      # pgTAP must run first: the concurrency and login tests below commit data.
       - run: supabase test db
       - run: deno test --allow-net=127.0.0.1:54322 --allow-env=DATABASE_URL --allow-read supabase/tests-concurrency/
-      - run: deno test --permit-no-files supabase/functions/
+      - name: Start the login function
+        run: |
+          supabase status -o env > "$RUNNER_TEMP/stack.env"
+          set -a; . "$RUNNER_TEMP/stack.env"; set +a
+          nohup supabase functions serve --env-file supabase/functions/.env.ci > "$RUNNER_TEMP/functions.log" 2>&1 &
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API_URL/functions/v1/login" \
+              -H "apikey: $ANON_KEY" -H 'Content-Type: application/json' -d '{}' || true)
+            if [ "$code" = "400" ]; then echo "login function is up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "login function did not answer 400 within 60 s (last status: $code)"
+          cat "$RUNNER_TEMP/functions.log"
+          exit 1
+      - name: Login function tests
+        run: |
+          set -a; . "$RUNNER_TEMP/stack.env"; . supabase/functions/.env.ci; set +a
+          export SUPABASE_URL="$API_URL" SUPABASE_ANON_KEY="$ANON_KEY" SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE_KEY"
+          deno test --allow-net=127.0.0.1 \
+            --allow-env=SUPABASE_URL,SUPABASE_ANON_KEY,SUPABASE_SERVICE_ROLE_KEY,AUTH_DERIVE_SECRET,APP_ORIGIN \
+            supabase/functions/
+      - name: Functions log
+        if: failure()
+        run: cat "$RUNNER_TEMP/functions.log" || true

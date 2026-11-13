@@ -24,3 +24,16 @@ port = 54323
 enabled = true
 site_url = "http://127.0.0.1:3000"
 enable_signup = false
+
+# Local/CI stack only. The login integration test signs in far more often than the default rate limit allows.
+[auth.rate_limit]
+sign_in_sign_ups = 1000
+token_refresh = 1000
+token_verifications = 1000
+
+[edge_runtime]
+enabled = true
+
+# The login function is called before the user has a token; it authenticates by itself (employee number + secret).
+[functions.login]
+verify_jwt = false
