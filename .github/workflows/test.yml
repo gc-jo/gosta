@@ -44,3 +44,6 @@ jobs:
       - name: Functions log
         if: failure()
         run: cat "$RUNNER_TEMP/functions.log" || true
+      - name: Auth log
+        if: failure()
+        run: docker logs supabase_auth_gosta 2>&1 | tail -60 || true
