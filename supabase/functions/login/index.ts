@@ -30,8 +30,9 @@ function respond(cfg: LoginConfig, status: number, body?: unknown): Response {
 
 const bad = (c: LoginConfig) => respond(c, 400, { error: "BAD_REQUEST" });
 const invalid = (c: LoginConfig) => respond(c, 401, { error: "INVALID_CREDENTIALS" });
-const fail = (c: LoginConfig, tag: string) => {
-  console.error(`login: ${tag}`); // a short tag only: never an error object, a secret or a key
+const fail = (c: LoginConfig, tag: string, err?: { status?: number; code?: string; message?: string }) => {
+  // a short tag, plus status/code/message of an Auth error (GoTrue messages carry no credentials): never the object
+  console.error(`login: ${tag}${err ? ` [${err.status ?? "?"} ${err.code ?? "?"} ${String(err.message ?? "").slice(0, 100)}]` : ""}`);
   return respond(c, 500, { error: "SERVER_ERROR" });
 };
 
@@ -94,13 +95,13 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
     let passwordSet = false;
     if (!authId) {
       const created = await admin.createUser({ email, password: derived, email_confirm: true });
-      if (created.error && !isAlreadyRegistered(created.error)) return fail(cfg, "createUser failed");
+      if (created.error && !isAlreadyRegistered(created.error)) return fail(cfg, "createUser failed", created.error);
       const att = await deps.service.rpc("login_attach_auth_user", { p_user_id: userId });
       if (att.error || !att.data || typeof att.data !== "string") return fail(cfg, "attach failed");
       authId = att.data;
       // 3. an Auth user found by email is trusted only once its password is ours
       const upd = await admin.updateUserById(authId, { password: derived });
-      if (upd.error) return fail(cfg, "password set failed");
+      if (upd.error) return fail(cfg, "password set failed", upd.error);
       passwordSet = true;
     }
 
@@ -108,11 +109,11 @@ export async function handleLogin(req: Request, deps: LoginDeps): Promise<Respon
     const signIn = () => deps.makeAnon().auth.signInWithPassword({ email, password: derived });
     let res = await signIn();
     if (res.error || !res.data.session) {
-      if (passwordSet) return fail(cfg, "sign-in failed");
+      if (passwordSet) return fail(cfg, "sign-in failed", res.error ?? undefined);
       const upd = await admin.updateUserById(authId, { password: derived });
-      if (upd.error) return fail(cfg, "password repair failed");
+      if (upd.error) return fail(cfg, "password repair failed", upd.error);
       res = await signIn();
-      if (res.error || !res.data.session) return fail(cfg, "sign-in failed after repair");
+      if (res.error || !res.data.session) return fail(cfg, "sign-in failed after repair", res.error ?? undefined);
     }
     const session = res.data.session;
 
