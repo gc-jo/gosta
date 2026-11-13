@@ -31,7 +31,7 @@ Type the new password **once**, in statement 2, between the two `$pw$` markers, 
 
 First run the check query shown after the block and note the owner's `credential_version`.
 
-Then run the whole block as one unit, exactly as written. It is a single transaction. Its first statement takes a lock on the owner's row. A login with the old password cannot get past the block: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended by statement 6. Do not run the statements one at a time and do not remove or move the first one: without it a login in progress can leave a working session behind.
+Then run the whole block as one unit, exactly as written. It is a single transaction. Its first statement takes a lock on the owner's row. A login with the old password cannot get past the block: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended by statement 6. Do not run the statements one at a time and do not remove or move the first one: without it a login in progress can leave a working session behind. Statements 5, 6 and 7 each check that the password from statement 2 is still present in the same transaction, so if an editor were to run the statements separately they change nothing instead of signing the owner out and recording a recovery that did not happen.
 
 ```sql
 begin;
@@ -63,15 +63,17 @@ on conflict (user_id) do update set secret_hash = excluded.secret_hash;
 -- 5. invalidate logins in flight and clear any lock
 update app_users
 set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
-where role = 'owner';
+where role = 'owner' and current_setting('recovery.new_password') <> '';
 
 -- 6. end every existing owner session
 update app_sessions
 set revoked_at = clock_timestamp()
-where user_id = (select id from app_users where role = 'owner') and revoked_at is null;
+where user_id = (select id from app_users where role = 'owner') and revoked_at is null
+  and current_setting('recovery.new_password') <> '';
 
 -- 7. record that this was done
-select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb);
+select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb)
+where current_setting('recovery.new_password') <> '';
 
 commit;
 ```
@@ -87,7 +89,7 @@ from app_users u
 where role = 'owner';
 ```
 
-After the block it must return exactly one row, with `live_sessions` = 0 and `credential_version` exactly one higher than the value you noted before the block. If the version did not change, the block did not take effect, whatever the editor displayed. Then sign in to the app with the new password and **change it again from Settings straight away**: the password you typed is kept in the dashboard's query history and may be written to the database's statement and error logs, whether the block succeeded or not.
+After the block it must return exactly one row, with `live_sessions` = 0 and `credential_version` exactly one higher than the value you noted before the block. If the version did not change, the block did not take effect, whatever the editor displayed. The final proof is the next step: the new password signs in and the old one does not. Then sign in to the app with the new password and **change it again from Settings straight away**: the password you typed is kept in the dashboard's query history and may be written to the database's statement and error logs, whether the block succeeded or not.
 
 What this does not touch: the owner's sign-ins at Supabase Auth itself are not ended. They are useless on their own, because every read and every action in the app checks the app's own session list, which statement 6 has just emptied. This holds as long as nothing is added to the project that trusts a Supabase Auth session without that check.
 
