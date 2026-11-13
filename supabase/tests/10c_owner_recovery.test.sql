@@ -4,7 +4,7 @@
 -- Everything runs as postgres, like the dashboard's SQL editor (which bypasses the app's access rules);
 -- the seeded owner is '100' with password 'correct horse battery'.
 begin;
-select plan(32);
+select plan(39);
 
 create schema t12c;
 create function t12c.owner_id() returns uuid language sql stable as $$ select id from app_users where role = 'owner' $$;
@@ -61,21 +61,53 @@ values ('c0c0c0c0-0000-4000-8000-000000000001', t12c.owner_id(), clock_timestamp
 select is(t12c.live(), 3::bigint, 'three live owner sessions before the reset');
 create table t12c.before as select t12c.cv() as cv, (select auth_user_id from app_users where role = 'owner') as auth_id;
 
+-- The runbook's block is: begin; <4 statements>; commit;. An explicit begin/commit cannot be nested inside this
+-- file's own transaction, so the statements run here without them; the real begin ... commit, including that a
+-- login in flight waits on the row lock taken by statement 1, is exercised on two connections by
+-- supabase/tests-concurrency/owner_recovery_test.ts, which reads the block from the runbook itself.
+-- If a statement fails, the real block stops at it and the transaction is rolled back, so nothing after it runs;
+-- here we assert that the failing statement itself changes nothing.
+create table t12c.snap as
+select (select secret_hash from app_user_secrets where user_id = t12c.owner_id()) as hash, t12c.cv() as cv, t12c.live() as live;
+
 select lives_ok($q$
-update app_user_secrets
-set secret_hash = extensions.crypt('brand new owner pass 123', extensions.gen_salt('bf', 10))
-where user_id = (select id from app_users where role = 'owner');
-$q$, 'runbook 2 statement 1: store the new password');
+select id from app_users where role = 'owner' for update;
+$q$, 'runbook 2 statement 1: lock the owner row');
+
+-- a password that is too short, and one with a control character (a tab), are refused and change nothing
+select throws_ok($q$
+insert into app_user_secrets (user_id, secret_hash)
+select id, extensions.crypt(app.clean_secret('owner', 'too short'), extensions.gen_salt('bf', 10))
+from app_users where role = 'owner'
+on conflict (user_id) do update set secret_hash = excluded.secret_hash;
+$q$, 'P0001', 'SECRET_WEAK', 'runbook 2 statement 2: a too-short password is refused');
+select throws_ok($q$
+insert into app_user_secrets (user_id, secret_hash)
+select id, extensions.crypt(app.clean_secret('owner', 'brand new	owner pass 123'), extensions.gen_salt('bf', 10))
+from app_users where role = 'owner'
+on conflict (user_id) do update set secret_hash = excluded.secret_hash;
+$q$, 'P0001', 'SECRET_INVALID', 'runbook 2 statement 2: a password with a control character is refused');
+select is((select secret_hash from app_user_secrets where user_id = t12c.owner_id()), (select hash from t12c.snap), 'refused passwords leave the hash unchanged');
+select is(t12c.cv(), (select cv from t12c.snap), 'and the version unchanged');
+select is(t12c.live(), (select live from t12c.snap), 'and the sessions unchanged');
+
 select lives_ok($q$
-update app_sessions
-set revoked_at = clock_timestamp()
-where user_id = (select id from app_users where role = 'owner') and revoked_at is null;
-$q$, 'runbook 2 statement 2: end every owner session');
+insert into app_user_secrets (user_id, secret_hash)
+select id, extensions.crypt(app.clean_secret('owner', 'brand new owner pass 123'), extensions.gen_salt('bf', 10))
+from app_users where role = 'owner'
+on conflict (user_id) do update set secret_hash = excluded.secret_hash;
+$q$, 'runbook 2 statement 2: store the new password');
 select lives_ok($q$
 update app_users
 set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
 where role = 'owner';
 $q$, 'runbook 2 statement 3: advance the version');
+select lives_ok($q$
+update app_sessions
+set revoked_at = clock_timestamp()
+where user_id = (select id from app_users where role = 'owner') and revoked_at is null;
+$q$, 'runbook 2 statement 4: end every owner session');
+select isnt((select secret_hash from app_user_secrets where user_id = t12c.owner_id()), (select hash from t12c.snap), 'the stored hash changed');
 
 select is(t12c.live(), 0::bigint, 'every prior owner session is revoked');
 select is(t12c.cv(), (select cv + 1 from t12c.before), 'credential_version rose by 1');
