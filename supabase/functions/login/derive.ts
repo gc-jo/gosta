@@ -5,6 +5,14 @@ export function checkDeriveSecret(secret: string | undefined | null): boolean {
   return typeof secret === "string" && secret.length >= 32;
 }
 
+/**
+ * Plan rule (ad): no control characters (Unicode category Cc: U+0000-U+001F and U+007F-U+009F) in an employee
+ * number or a secret. The database applies the same ranges in app.clean_secret and login_verify (migration 0013).
+ */
+export function hasControlChar(s: string): boolean {
+  return /[\u0000-\u001f\u007f-\u009f]/.test(s);
+}
+
 /** True when APP_ORIGIN is a plain http(s) origin (scheme://host[:port], nothing else). */
 export function checkAppOrigin(origin: string | undefined | null): boolean {
   if (typeof origin !== "string" || origin === "") return false;

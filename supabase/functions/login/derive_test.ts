@@ -1,5 +1,5 @@
 import { assertEquals, assertMatch, assertNotEquals, assertThrows } from "jsr:@std/assert@1.0.13";
-import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
+import { checkAppOrigin, hasControlChar, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
 
 Deno.test("deriveAuthPassword is deterministic, 64 hex chars, depends on both inputs", async () => {
   const a = await deriveAuthPassword("k1", "u1");
@@ -60,4 +60,13 @@ Deno.test("checkAppOrigin accepts plain http(s) origins only", () => {
   for (const no of [undefined, null, "", "*", "app.example.com", "https://app.example.com/", "https://app.example.com/path", "ftp://x.com", "javascript:alert(1)", "https://a.com, https://b.com"]) {
     assertEquals(checkAppOrigin(no as string | undefined), false, String(no));
   }
+});
+
+Deno.test("hasControlChar: exactly Unicode Cc, U+0000-U+001F and U+007F-U+009F (same table as 10d_secret_characters.test.sql)", () => {
+  for (let n = 0; n <= 0x2ff; n++) {
+    const cc = n <= 0x1f || (n >= 0x7f && n <= 0x9f);
+    assertEquals(hasControlChar("ab" + String.fromCodePoint(n) + "cd"), cc, `U+${n.toString(16).padStart(4, "0")}`);
+  }
+  for (const n of [0x0, 0x9, 0xa, 0xd, 0x1f, 0x7f, 0x85, 0x9f]) assertEquals(hasControlChar(String.fromCodePoint(n)), true);
+  for (const ok of [" ", "\u00a0", "\u0600", "\u0661\u0662", "\u{1F600}", '"', "\\", "\u2028", "\u200f"]) assertEquals(hasControlChar(ok), false, JSON.stringify(ok));
 });

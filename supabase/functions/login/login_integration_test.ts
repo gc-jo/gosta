@@ -391,6 +391,74 @@ Deno.test("13. a token signed in directly against Auth but never registered is r
   await assertDead("unregistered", direct.json.access_token);
 });
 
+// 16 --------------------------------------------------------------------------------------------------
+// Plan rule (ad): the same character rule when a secret is set and when it is submitted. Every body below is
+// built with JSON.stringify, as a client would send it.
+Deno.test("16a. the owner cannot set a password with a control character, and the old one keeps working", async () => {
+  const owner = await ownerToken();
+  const ownerRow = await appUser("100");
+  for (const cp of [0x09, 0x85, 0x7f]) {
+    const pw = "abcdefghijk" + String.fromCodePoint(cp) + "lm";
+    submitted.add(pw);
+    const r = await rpc("admin_set_secret", owner, { p_request_id: rid(), p_user_id: ownerRow.id, p_secret: pw });
+    assertEquals(r.status, 400, `U+${cp.toString(16)} status`);
+    assertEquals(r.json.message, "SECRET_INVALID", `U+${cp.toString(16)}`);
+  }
+  assertEquals((await login("100", OWNER_PASSWORD)).status, 200, "the seeded password is unchanged");
+});
+
+Deno.test("16b. unusual but allowed characters round-trip exactly; one changed character is refused", async () => {
+  const P = 'pa ss "q" \\ \u0661\u0662\u0663 \u0643\u0644\u0645\u0629 \u{1F600} xyz';
+  assert([...P].length >= 12 && new TextEncoder().encode(P).length <= 72, "password within 12 characters / 72 bytes");
+  const wrong = P.replace("xyz", "xyw");
+  assertNotEquals(wrong, P);
+  const owner = await ownerToken();
+  const ownerRow = await appUser("100");
+  let changed = false;
+  try {
+    submitted.add(P);
+    const set = await rpc("admin_set_secret", owner, { p_request_id: rid(), p_user_id: ownerRow.id, p_secret: P });
+    assertEquals(set.status, 200, set.text);
+    changed = true;
+    assertEquals((await login("100", wrong)).status, 401, "one changed character is refused");
+    const ok = await login("100", P);
+    assertEquals(ok.status, 200, "the exact string logs in");
+    assertEquals(ok.json.user.role, "owner");
+    assertEquals((await login("100", OWNER_PASSWORD)).status, 401, "the previous password is dead");
+  } finally {
+    if (changed) {
+      const l = await login("100", P); // put the seeded password back: later tests depend on it
+      if (l.status === 200) {
+        const back = await rpc("admin_set_secret", l.json.access_token, { p_request_id: rid(), p_user_id: ownerRow.id, p_secret: OWNER_PASSWORD });
+        console.log(`restoring the owner's seeded password -> ${back.status}`);
+      } else console.log(`could not log in to restore the owner's password: ${l.status}`);
+    }
+  }
+  assertEquals((await login("100", OWNER_PASSWORD)).status, 200, "the seeded password works again");
+});
+
+Deno.test("16c. the login endpoint refuses a JSON-encoded control character with 400, for known and unknown numbers", async () => {
+  for (const num of ["201", "98765432101"]) {
+    for (const cp of [0x00, 0x09, 0x0a, 0x7f, 0x85, 0x9f]) {
+      const ch = String.fromCodePoint(cp);
+      const r = await loginRaw(JSON.stringify({ employee_number: num, secret: "11" + ch + "11" }));
+      assertEquals([r.status, r.text], [400, '{"error":"BAD_REQUEST"}'], `${num} U+${cp.toString(16)}`);
+    }
+  }
+});
+
+Deno.test("16d. a staff PIN with a control character cannot be set (SECRET_INVALID)", async () => {
+  const owner = await ownerToken();
+  const u = await makeUser(owner, "7878");
+  for (const pin of ["12\t4", "1234\u0085", "\u007f123"]) {
+    const r = await rpc("admin_set_secret", owner, { p_request_id: rid(), p_user_id: u.id, p_secret: pin });
+    assertEquals(r.status, 400);
+    assertEquals(r.json.message, "SECRET_INVALID", JSON.stringify(pin));
+  }
+  assertEquals((await rpc("admin_set_secret", owner, { p_request_id: rid(), p_user_id: u.id, p_secret: "12345" })).json.message, "SECRET_WEAK");
+  assertEquals((await login(u.num, u.pin)).status, 200, "the PIN is unchanged");
+});
+
 // 14 --------------------------------------------------------------------------------------------------
 Deno.test("14. seeded users can still log in", async () => {
   for (const [n, s] of [["100", OWNER_PASSWORD], ["201", "1111"], ["202", "2222"], ["203", "0303"], ["301", "3333"], ["215", "1515"]]) {

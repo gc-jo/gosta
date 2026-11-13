@@ -2,7 +2,7 @@
 // The database decides who may log in (login_verify) and which sessions count (login_register_session);
 // this function only turns a verified login into an Auth session. See spec section 5.
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2.49.4";
-import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
+import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, hasControlChar, sessionIdFromJwt } from "./derive.ts";
 
 const MAX_BODY_BYTES = 1024;
 const EMAIL_DOMAIN = "gosta.invalid";
@@ -30,9 +30,12 @@ function respond(cfg: LoginConfig, status: number, body?: unknown): Response {
 
 const bad = (c: LoginConfig) => respond(c, 400, { error: "BAD_REQUEST" });
 const invalid = (c: LoginConfig) => respond(c, 401, { error: "INVALID_CREDENTIALS" });
-const fail = (c: LoginConfig, tag: string, err?: { status?: number; code?: string; message?: string }) => {
-  // a short tag, plus status/code/message of an Auth error (GoTrue messages carry no credentials): never the object
-  console.error(`login: ${tag}${err ? ` [${err.status ?? "?"} ${err.code ?? "?"} ${String(err.message ?? "").slice(0, 100)}]` : ""}`);
+const fail = (c: LoginConfig, tag: string, err?: { status?: number; code?: string }) => {
+  // routine logs: a diagnostic tag, the HTTP status and the error code of an Auth failure; never its free-text
+  // message, an email, a secret, a key or the error object (plan rule (ae))
+  const code = typeof err?.code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(err.code) ? err.code : "?";
+  const status = typeof err?.status === "number" ? err.status : "?";
+  console.error(`login: ${tag}${err ? ` [${status} ${code}]` : ""}`);
   return respond(c, 500, { error: "SERVER_ERROR" });
 };
 
@@ -64,9 +67,6 @@ async function readCapped(req: Request): Promise<string | null> {
   }
 }
 
-// C0 controls (NUL included), DEL and C1 controls never belong in an employee number or a secret
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
-
 /** Reads and validates the body; null when it is not acceptable. */
 async function readBody(req: Request): Promise<{ employee_number: string; secret: string } | null> {
   const text = await readCapped(req);
@@ -80,7 +80,7 @@ async function readBody(req: Request): Promise<{ employee_number: string; secret
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
   const { employee_number, secret } = parsed as Record<string, unknown>;
   if (typeof employee_number !== "string" || typeof secret !== "string") return null;
-  if (CONTROL.test(employee_number) || CONTROL.test(secret)) return null;
+  if (hasControlChar(employee_number) || hasControlChar(secret)) return null; // same rule as the database
   return { employee_number, secret };
 }
 

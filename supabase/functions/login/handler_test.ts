@@ -241,17 +241,57 @@ Deno.test("body cap is enforced while streaming, whatever Content-Length says", 
   const m = await run({ rpc: { login_verify: { data: { ok: false, reason: "invalid" }, error: null } }, signin: [] }, post(okSize));
   assertEquals(m.status, 401);
 });
-Deno.test("control characters in either field are a 400 and never reach the database", async () => {
-  for (const f of ["\u0000", "a\u0000b", "\n", "\u007f", "\u0085"]) {
+Deno.test("control characters in either field are a 400 and never reach the database (JSON-encoded bodies)", async () => {
+  // bodies are built with JSON.stringify, as a client would send them: a tab is \t, NUL is \u0000, U+0085 a real character
+  for (const n of [0x0, 0x9, 0xa, 0xd, 0x1f, 0x7f, 0x85, 0x9f]) {
+    const ch = String.fromCodePoint(n);
     for (const body of [
-      `{"employee_number":"20${f}1","secret":"1111"}`,
-      `{"employee_number":"201","secret":"11${f}11"}`,
+      { employee_number: "201", secret: "11" + ch + "11" },
+      { employee_number: "201", secret: ch },
+      { employee_number: "20" + ch + "1", secret: "1111" },
     ]) {
-      const r = await run({ rpc: { login_verify: verify("a") }, signin: [] }, post(body));
-      assertEquals([r.status, r.text], [400, '{"error":"BAD_REQUEST"}'], body);
+      const r = await run({ rpc: { login_verify: verify("a") }, signin: [] }, post(JSON.stringify(body)));
+      assertEquals([r.status, r.text], [400, '{"error":"BAD_REQUEST"}'], `U+${n.toString(16)} ${JSON.stringify(body)}`);
       assertEquals(r.calls, []);
     }
   }
+});
+Deno.test("boundary characters are accepted and reach login_verify exactly as sent", async () => {
+  const secrets = [" ", "a b", "\u00a0", "\u0600\u0644\u0645", "\u0661\u0662\u0663\u0664", "\u{1F600}", 'say "hi"', "back\\slash", "\u2028"];
+  for (const secret of secrets) {
+    const r = await run({ rpc: { login_verify: { data: { ok: false, reason: "invalid" }, error: null } }, signin: [] }, post(JSON.stringify({ employee_number: "201", secret })));
+    assertEquals(r.status, 401, JSON.stringify(secret));
+    assertEquals(r.args.login_verify, [{ p_employee_number: "201", p_secret: secret }], "passed through unaltered");
+  }
+});
+Deno.test("routine logs carry tag, status and code only", async () => {
+  const lines: string[] = [];
+  const orig = console.error;
+  console.error = (...a: unknown[]) => void lines.push(a.map(String).join(" "));
+  try {
+    const MSG = "Database error for victim@gosta.invalid secret s3cret-value";
+    const authErr = { status: 500, code: "unexpected_failure", message: MSG };
+    const cases: Any[] = [
+      { rpc: { login_verify: verify(null), login_attach_auth_user: { data: null, error: null } }, create: { error: authErr }, signin: [] },
+      { rpc: { login_verify: verify(null), login_attach_auth_user: { data: "a1", error: null } }, update: { error: authErr }, signin: [] },
+      { rpc: { login_verify: verify("a") }, update: { error: authErr }, signin: [bad] },
+      { rpc: { login_verify: verify("a") }, signin: [{ data: { session: null }, error: authErr }, { data: { session: null }, error: authErr }] },
+      { rpc: { login_verify: verify("a"), login_register_session: { error: { message: MSG } } }, signin: [session] },
+      { rpc: { login_verify: { data: null, error: { message: MSG } } }, signin: [] },
+      { rpc: { login_verify: verify("a"), ...ok }, signin: [session], profile: { data: null, error: { message: MSG } } },
+      { rpc: { login_verify: verify("a") }, signin: [{ data: { session: { access_token: "a.e30.c", refresh_token: "r", expires_at: 1 } }, error: null }] },
+      { rpc: {}, signin: [], derive: "short" },
+    ];
+    for (const c of cases) assertEquals((await run(c)).status, 500);
+  } finally {
+    console.error = orig;
+  }
+  assertEquals(lines.length, 9);
+  for (const l of lines) {
+    assert(/^login: [a-z0-9_ ()\-.A-Z]+( \[(\d{3}|\?) ([A-Za-z0-9_]+|\?)\])?$/.test(l), `log line shape: ${l}`);
+    for (const bad of ["Database error", "victim", "@gosta.invalid", "s3cret-value", SECRET, "eyJ"]) assert(!l.includes(bad), `log line leaks ${bad}: ${l}`);
+  }
+  assert(lines.some((l) => l.endsWith("[500 unexpected_failure]")), "status and code are logged");
 });
 Deno.test("an empty or malformed APP_ORIGIN fails closed with 500 on every request", async () => {
   for (const origin of ["", "not a url", "https://app.example.com/path", "*"]) {
