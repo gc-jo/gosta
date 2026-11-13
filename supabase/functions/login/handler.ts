@@ -2,7 +2,7 @@
 // The database decides who may log in (login_verify) and which sessions count (login_register_session);
 // this function only turns a verified login into an Auth session. See spec section 5.
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2.49.4";
-import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, hasControlChar, sessionIdFromJwt } from "./derive.ts";
+import { checkAppOrigin, checkDeriveSecret, deriveAuthPassword, hasControlChar, isWellFormedString, sessionIdFromJwt } from "./derive.ts";
 
 const MAX_BODY_BYTES = 1024;
 const EMAIL_DOMAIN = "gosta.invalid";
@@ -81,6 +81,8 @@ async function readBody(req: Request): Promise<{ employee_number: string; secret
   const { employee_number, secret } = parsed as Record<string, unknown>;
   if (typeof employee_number !== "string" || typeof secret !== "string") return null;
   if (hasControlChar(employee_number) || hasControlChar(secret)) return null; // same rule as the database
+  // a lone surrogate (JSON "\ud800") is not text that can be sent to the database: refuse it here, not as a 500 there
+  if (!isWellFormedString(employee_number) || !isWellFormedString(secret)) return null;
   return { employee_number, secret };
 }
 

@@ -13,6 +13,13 @@ export function hasControlChar(s: string): boolean {
   return /[\u0000-\u001f\u007f-\u009f]/.test(s);
 }
 
+/** True when the string is well-formed UTF-16 (no lone surrogate); such a string cannot be stored or sent as UTF-8. */
+export function isWellFormedString(s: string): boolean {
+  const f = (s as unknown as { isWellFormed?: () => boolean }).isWellFormed;
+  if (typeof f === "function") return f.call(s);
+  return !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+}
+
 /** True when APP_ORIGIN is a plain http(s) origin (scheme://host[:port], nothing else). */
 export function checkAppOrigin(origin: string | undefined | null): boolean {
   if (typeof origin !== "string" || origin === "") return false;

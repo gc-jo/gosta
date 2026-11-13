@@ -300,3 +300,24 @@ Deno.test("an empty or malformed APP_ORIGIN fails closed with 500 on every reque
     assertEquals(r.calls, []);
   }
 });
+
+Deno.test("lone surrogates in a field are a 400 and never reach the database", async () => {
+  const bodies = [
+    JSON.stringify({ employee_number: "201", secret: "\ud800" }),            // JSON.stringify escapes it as \ud800
+    JSON.stringify({ employee_number: "\udc00", secret: "1111" }),
+    JSON.stringify({ employee_number: "201", secret: "11\udc00\ud80011" }),   // reversed pair
+    '{"employee_number":"201","secret":"\\ud800"}',                            // hand-written escapes
+    '{"employee_number":"201","secret":"\\udc00"}',
+    '{"employee_number":"201","secret":"\\udc00\\ud800"}',
+    '{"employee_number":"2\\ud8001","secret":"1111"}',
+  ];
+  for (const b of bodies) {
+    const r = await run({ rpc: { login_verify: verify("a") }, signin: [] }, post(b));
+    assertEquals([r.status, r.text], [400, '{"error":"BAD_REQUEST"}'], b);
+    assertEquals(r.calls, []);
+  }
+  // a valid pair, written as escapes, is accepted and passed on as the real character
+  const ok = await run({ rpc: { login_verify: { data: { ok: false, reason: "invalid" }, error: null } }, signin: [] }, post('{"employee_number":"201","secret":"a\\ud83d\\ude00b"}'));
+  assertEquals(ok.status, 401);
+  assertEquals(ok.args.login_verify[0].p_secret, "a\u{1F600}b");
+});

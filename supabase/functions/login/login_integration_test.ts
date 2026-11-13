@@ -447,6 +447,29 @@ Deno.test("16c. the login endpoint refuses a JSON-encoded control character with
   }
 });
 
+Deno.test("16c2. a lone surrogate in a JSON field is a 400 for known and unknown numbers", async () => {
+  for (const num of ["201", "98765432101"]) {
+    for (const lone of ["\\ud800", "\\udc00", "\\udc00\\ud800"]) {
+      const r = await loginRaw(`{"employee_number":"${num}","secret":"11${lone}11"}`);
+      assertEquals([r.status, r.text], [400, '{"error":"BAD_REQUEST"}'], `${num} ${lone}`);
+    }
+  }
+});
+
+Deno.test("16e. NUL in a secret sent through PostgREST: record what happens, and nothing changes", async () => {
+  const owner = await ownerToken();
+  const ownerRow = await appUser("100");
+  const body = `{"p_request_id":"${rid()}","p_user_id":"${ownerRow.id}","p_secret":"abcdefghijk\\u0000lm"}`;
+  const r = await http(`${BASE}/rest/v1/rpc/admin_set_secret`, {
+    method: "POST",
+    headers: { apikey: ANON, Authorization: `Bearer ${owner}`, "Content-Type": "application/json" },
+    body,
+  });
+  console.log(`NUL via PostgREST admin_set_secret -> ${r.status} ${r.text.slice(0, 160)}`);
+  assert(r.status >= 400 && r.status < 600, "a secret containing NUL is refused");
+  assertEquals((await login("100", OWNER_PASSWORD)).status, 200, "the owner's password is unchanged");
+});
+
 Deno.test("16d. a staff PIN with a control character cannot be set (SECRET_INVALID)", async () => {
   const owner = await ownerToken();
   const u = await makeUser(owner, "7878");

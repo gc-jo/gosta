@@ -1,5 +1,5 @@
 import { assertEquals, assertMatch, assertNotEquals, assertThrows } from "jsr:@std/assert@1.0.13";
-import { checkAppOrigin, hasControlChar, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
+import { isWellFormedString, checkAppOrigin, hasControlChar, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
 
 Deno.test("deriveAuthPassword is deterministic, 64 hex chars, depends on both inputs", async () => {
   const a = await deriveAuthPassword("k1", "u1");
@@ -69,4 +69,14 @@ Deno.test("hasControlChar: exactly Unicode Cc, U+0000-U+001F and U+007F-U+009F (
   }
   for (const n of [0x0, 0x9, 0xa, 0xd, 0x1f, 0x7f, 0x85, 0x9f]) assertEquals(hasControlChar(String.fromCodePoint(n)), true);
   for (const ok of [" ", "\u00a0", "\u0600", "\u0661\u0662", "\u{1F600}", '"', "\\", "\u2028", "\u200f"]) assertEquals(hasControlChar(ok), false, JSON.stringify(ok));
+});
+
+Deno.test("isWellFormedString: lone surrogates are refused, pairs and BMP text are fine", () => {
+  assertEquals(isWellFormedString("abc \u0661 \u{1F600} \ud83d\ude00"), true);
+  for (const bad of ["\ud800", "\udc00", "a\ud800b", "\udc00\ud800", "\ud800\ud800", "x\udbff", "\udfffx"]) {
+    assertEquals(isWellFormedString(bad), false, JSON.stringify(bad));
+  }
+  // the regex fallback agrees with the built-in on a sample
+  const re = (s: string) => !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+  for (const s of ["", "a", "\u{1F600}", "\ud800", "\udc00\ud800", "ab\udc00"]) assertEquals(re(s), isWellFormedString(s));
 });
