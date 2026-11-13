@@ -456,6 +456,13 @@ Deno.test("16c2. a lone surrogate in a JSON field is a 400 for known and unknown
   }
 });
 
+Deno.test("16c3. a lone surrogate in the employee-number field (known secret) is a 400", async () => {
+  for (const lone of ["\\ud800", "\\udc00", "\\udc00\\ud800"]) {
+    const r = await loginRaw(`{"employee_number":"201${lone}","secret":"1111"}`);
+    assertEquals([r.status, r.text], [400, '{"error":"BAD_REQUEST"}'], lone);
+  }
+});
+
 Deno.test("16e. NUL in a secret sent through PostgREST: record what happens, and nothing changes", async () => {
   const owner = await ownerToken();
   const ownerRow = await appUser("100");
@@ -466,7 +473,8 @@ Deno.test("16e. NUL in a secret sent through PostgREST: record what happens, and
     body,
   });
   console.log(`NUL via PostgREST admin_set_secret -> ${r.status} ${r.text.slice(0, 160)}`);
-  assert(r.status >= 400 && r.status < 600, "a secret containing NUL is refused");
+  assertEquals(r.status, 400, "a secret containing NUL is refused with 400");
+  assertEquals(r.json?.code, "22P05", "by Postgres: unsupported Unicode escape sequence");
   assertEquals((await login("100", OWNER_PASSWORD)).status, 200, "the owner's password is unchanged");
 });
 

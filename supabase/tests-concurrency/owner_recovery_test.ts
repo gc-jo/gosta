@@ -11,7 +11,7 @@
 // The tests COMMIT real changes to the owner's rows and restore them in `finally` (activity_log is insert-only, so
 // LOGIN_* and OWNER_PASSWORD_RECOVERY rows stay). Afterwards the owner must log in with the seeded password.
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1.0.13";
-import { backendPid, blockersOf, type Conn, connect, waitUntilBlockedBy } from "./helpers.ts";
+import { backendPid, type Conn, connect, waitUntilBlockedBy } from "./helpers.ts";
 
 const RUNBOOK = new URL("../../docs/runbooks/owner-account-recovery.md", import.meta.url);
 const SEEDED = "correct horse battery";
@@ -75,6 +75,11 @@ export function splitSql(sql: string): string[] {
  * $pw$...$pw$ literal of the set_config statement. Fails loudly if the block has the wrong shape.
  */
 export function loadRecoveryBlock(md: string, password: string): string[] {
+  return splitAndCheck(rawRecoveryBlock(md, password));
+}
+
+/** The runbook's sql block exactly as printed (comments included), placeholder replaced only inside the $pw$ literal. */
+export function rawRecoveryBlock(md: string, password: string): string {
   const h = md.indexOf("\n## 2. Password lost");
   if (h < 0) throw new Error("runbook: heading '## 2. Password lost' not found");
   const rest = md.slice(h + 1);
@@ -87,7 +92,11 @@ export function loadRecoveryBlock(md: string, password: string): string[] {
   if (occurrences !== 1) throw new Error(`runbook: the placeholder must occur exactly once in the block, found ${occurrences}`);
   const literal = `$pw$${PLACEHOLDER}$pw$`;
   if (!raw.includes(literal)) throw new Error("runbook: the placeholder must sit inside the $pw$...$pw$ literal");
-  const stmts = splitSql(raw.replace(literal, () => `$pw$${password}$pw$`));
+  return raw.replace(literal, () => `$pw$${password}$pw$`);
+}
+
+function splitAndCheck(sql: string): string[] {
+  const stmts = splitSql(sql);
   if (stmts[0]?.toLowerCase() !== "begin") throw new Error("runbook block must start with begin;");
   if (stmts[stmts.length - 1]?.toLowerCase() !== "commit") throw new Error("runbook block must end with commit;");
   if (stmts[1] !== "select id from app_users where role = 'owner' for update") {
@@ -101,6 +110,14 @@ export function loadRecoveryBlock(md: string, password: string): string[] {
 async function block(password = NEW_PW): Promise<string[]> {
   return loadRecoveryBlock(await Deno.readTextFile(RUNBOOK), password);
 }
+/** The whole block as the person pastes it: one text, comments and all. */
+async function blockText(password = NEW_PW): Promise<string> {
+  const text = rawRecoveryBlock(await Deno.readTextFile(RUNBOOK), password);
+  splitAndCheck(text); // fails loudly on a wrong shape
+  return text;
+}
+/** Sends `text` as ONE simple-protocol message (several statements in one request). */
+const sendWhole = (c: Conn, text: string) => c.unsafe(text).simple().then((x) => x);
 // statement indexes: 0 begin, 1 lock, 2 set_config, 3 guard, 4 secret, 5 version bump, 6 sessions revoked, 7 log, 8 commit
 
 type Owner = {
@@ -358,14 +375,13 @@ Deno.test("DEMONSTRATION, old order in a transaction, no row lock: a verified lo
                     where user_id = (select id from app_users where role = 'owner')`);
     await r.unsafe(`update app_sessions set revoked_at = clock_timestamp()
                     where user_id = (select id from app_users where role = 'owner') and revoked_at is null`);
-    // not committed yet: L registers now; nothing holds the owner's app_users row, so L does not wait
+    // not committed yet: L registers now; nothing holds the owner's app_users row, so L must not wait.
+    // lock_timeout makes a wait fail fast (SQLSTATE 55P03) instead of hanging: no sleep, no race.
     await l.unsafe("begin");
     await l.unsafe("set local role service_role");
-    const pidL = await backendPid(l);
-    const call = register(l, owner.id, sid, v).then(() => "done");
-    const outcome = await Promise.race([call, new Promise<string>((res) => setTimeout(() => res("still running"), 2000))]);
-    assertEquals(outcome, "done", "the registration completed while R was still open: it was not waiting");
-    assertEquals(await blockersOf(admin, pidL), [], "L is blocked by nobody");
+    await l.unsafe("set local lock_timeout = '500ms'");
+    const err = await errMsg(register(l, owner.id, sid, v));
+    assertEquals(err, null, "the registration completed without waiting for R (a wait would raise lock_timeout)");
     await l.unsafe("commit");
     await r.unsafe(`update app_users set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null where role = 'owner'`);
     await r.unsafe("commit");
@@ -382,6 +398,156 @@ Deno.test("DEMONSTRATION, old order in a transaction, no row lock: a verified lo
     const ok = (await setup.unsafe("select app.session_ok() as ok"))[0] as unknown as { ok: boolean };
     await setup.unsafe("rollback");
     assertEquals(ok.ok, true, "and the database accepts it: a login with the OLD password is still signed in after the recovery");
+  });
+});
+
+// ---- login_verify with the NEW password racing the block ---------------------------------------------------------------
+Deno.test("recovery block: a login_verify with the NEW password that arrives during the block waits for R, then succeeds with the new version", async () => {
+  await withOwner(async ({ r, l, admin, owner }) => {
+    const stmts = await block();
+    const pidL = await backendPid(l), pidR = await backendPid(r);
+    for (let i = 0; i < stmts.length - 1; i++) await r.unsafe(stmts[i]); // everything but commit
+    await l.unsafe("begin");
+    await l.unsafe("set local role service_role");
+    const outcome = l.unsafe(`select public.login_verify('100', $1) as r`, [NEW_PW]).then((rows) => rows); // .then starts the lazy query
+    await waitUntilBlockedBy(admin, pidL, pidR);
+    await r.unsafe(stmts[stmts.length - 1]); // commit
+    const res = ((await outcome)[0] as unknown as { r: Verify }).r;
+    await l.unsafe("commit");
+    assertEquals(res.ok, true, "the new password verifies once the block has committed");
+    assertEquals(res.credential_version, owner.credential_version + 1);
+  });
+});
+
+// ---- the block as the runbook prescribes: ONE request ---------------------------------------------------------------------
+const CHECK_QUERY = `select employee_number, credential_version, locked_until,
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+from app_users u where role = 'owner'`;
+const auditCount = async (c: Conn) =>
+  Number(((await c.unsafe(`select count(*)::int as n from activity_log where action = 'OWNER_PASSWORD_RECOVERY'`))[0] as unknown as { n: number }).n);
+
+Deno.test("single request: the driver really sends one simple-protocol message (several statements in one message work with .simple(); the extended protocol refuses them)", async () => {
+  const c = connect();
+  try {
+    const res = await c.unsafe("select 1 as a; select 2 as b").simple();
+    assertEquals(res.length, 2, "two result sets came back from ONE request: the simple query protocol");
+    // the extended protocol (parse/bind/execute, used when parameters are sent) refuses several statements in one message
+    const err = await errMsg(c.unsafe("select 1 as a; select $1::int as b", [2]).then((x) => x));
+    assert(err !== null, "the same kind of text sent with parameters (extended protocol) is refused");
+    assertStringIncludes(err.message, "multiple commands");
+  } finally {
+    await c.end({ timeout: 5 }).catch(() => {});
+  }
+});
+
+Deno.test("single request: the whole block with a valid password succeeds in one request", async () => {
+  await withOwner(async ({ setup, r, l, owner }) => {
+    const audits = await auditCount(setup);
+    await sendWhole(r, await blockText());
+    const row = (await setup.unsafe(CHECK_QUERY))[0] as unknown as { credential_version: number; live_sessions: string | number };
+    assertEquals((await setup.unsafe(CHECK_QUERY)).length, 1, "the check query returns exactly one row");
+    assertEquals(Number(row.live_sessions), 0);
+    assertEquals(row.credential_version, owner.credential_version + 1);
+    assertEquals((await verifyAs(l, NEW_PW)).ok, true, "the new password verifies");
+    assertEquals((await verifyAs(l, SEEDED)).ok, false, "the old one does not");
+    assertEquals(await auditCount(setup), audits + 1, "exactly one OWNER_PASSWORD_RECOVERY row was added");
+  });
+});
+
+/** Nothing changed and the owner row is not locked by the failed connection `r` (checked from `other`, before any rollback on r). */
+async function assertFailedRequestLeftNothing({ setup, r, other, owner }: Ctx, audits: number, expected: string) {
+  const st = await state(setup, owner, crypto.randomUUID());
+  assertEquals([st.is_old, st.credential_version, st.unrevoked, await auditCount(setup)], [true, owner.credential_version, owner.live.length, audits], `${expected}: nothing changed`);
+  await other.unsafe("begin");
+  const got = await other.unsafe(`select id from app_users where role = 'owner' for update nowait`);
+  assertEquals(got.length, 1, "the owner row is not left locked: another connection locks it with NOWAIT, no rollback sent on r yet");
+  await other.unsafe("rollback");
+  await r.unsafe("rollback"); // only now
+  assertEquals(((await r.unsafe("select 1 as ok"))[0] as unknown as { ok: number }).ok, 1, "the failed connection is usable after rollback");
+}
+
+Deno.test("single request: the placeholder left in stops the block with STOP:, changes nothing and leaves no lock", async () => {
+  await withOwner(async (ctx) => {
+    const audits = await auditCount(ctx.setup);
+    const err = await errMsg(sendWhole(ctx.r, await blockText(PLACEHOLDER)));
+    assert(err !== null, "the request must fail");
+    assertStringIncludes(err.message, "STOP:");
+    assertStringIncludes(err.message, "placeholder");
+    await assertFailedRequestLeftNothing(ctx, audits, "placeholder");
+  });
+});
+
+Deno.test("single request: a 10-character password is refused with SECRET_WEAK, changes nothing and leaves no lock", async () => {
+  await withOwner(async (ctx) => {
+    const audits = await auditCount(ctx.setup);
+    const err = await errMsg(sendWhole(ctx.r, await blockText("tenchars12")));
+    assert(err !== null, "the request must fail");
+    assertStringIncludes(err.message, "SECRET_WEAK");
+    await assertFailedRequestLeftNothing(ctx, audits, "weak password");
+  });
+});
+
+Deno.test("single request: a login verified with the old password before the request cannot register after it", async () => {
+  await withOwner(async ({ setup, r, l, owner, created }) => {
+    const sid = crypto.randomUUID();
+    created.push(sid);
+    const v = await verifyOk(l); // committed
+    await sendWhole(r, await blockText()); // runs to completion and commits by itself
+    const err = await errMsg(asService(l, () => register(l, owner.id, sid, v)));
+    assert(err !== null, "the late registration must be refused");
+    assertStringIncludes(err.message, "USER_INVALID");
+    const st = await state(setup, owner, sid);
+    assertEquals([st.sid_rows, st.unrevoked, st.credential_version], [0, 0, owner.credential_version + 1]);
+  });
+});
+
+Deno.test("single request: a session registered before the request is revoked by it", async () => {
+  await withOwner(async ({ setup, r, l, owner, created }) => {
+    const sid = crypto.randomUUID();
+    created.push(sid);
+    const v = await verifyOk(l);
+    await asService(l, () => register(l, owner.id, sid, v)); // committed
+    await sendWhole(r, await blockText());
+    const row = (await setup.unsafe(`select revoked_at is not null as revoked from app_sessions where session_id = $1`, [sid]))[0] as unknown as { revoked: boolean };
+    assertEquals(row.revoked, true);
+    assertEquals((await state(setup, owner, sid)).unrevoked, 0);
+  });
+});
+
+// HAZARD, documented behaviour (not a guard): what happens when an auto-committing editor runs each statement of the
+// block as its own request, each on a different connection, i.e. NOT in one session and not in one transaction.
+Deno.test("HAZARD: each statement of the block sent as its own autocommit request on a fresh connection (not one session)", async () => {
+  await withOwner(async ({ setup, l, owner }) => {
+    const stmts = await block();
+    const audits = await auditCount(setup);
+    const outcomes: string[] = [];
+    for (const [i, sql] of stmts.entries()) {
+      const c = connect(); // a fresh connection per statement: no shared transaction, no shared settings
+      try {
+        await c.unsafe(sql);
+        outcomes.push(`${i}: ok`);
+      } catch (e) {
+        outcomes.push(`${i}: ERROR ${(e as Error).message}`);
+      } finally {
+        await c.end({ timeout: 5 }).catch(() => {});
+      }
+    }
+    console.log("HAZARD outcomes per statement (0 begin, 1 lock, 2 set_config, 3 guard, 4 secret, 5 version, 6 sessions, 7 log, 8 commit):\n  " + outcomes.join("\n  "));
+    const row = (await setup.unsafe(CHECK_QUERY))[0] as unknown as { credential_version: number; live_sessions: string | number };
+    const after = {
+      version: row.credential_version - owner.credential_version,
+      live_sessions: Number(row.live_sessions),
+      audits: (await auditCount(setup)) - audits,
+      old_password_still_works: (await verifyAs(l, SEEDED)).ok,
+    };
+    console.log("HAZARD state afterwards:", JSON.stringify(after));
+    // what the reviewer predicted, asserted as it actually happens:
+    assertStringIncludes(outcomes[3], "ERROR", "the guard (or at the latest the store) fails: the transaction-local setting is gone");
+    assertStringIncludes(outcomes[4], "ERROR", "the password is never stored");
+    assertEquals(after.old_password_still_works, true, "the old password still works");
+    assertEquals(after.version, 1, "but the version was bumped (statement 5 ran)");
+    assertEquals(after.live_sessions, 0, "every owner session was revoked (statement 6 ran)");
+    assertEquals(after.audits, 1, "and a recovery audit row was written (statement 7 ran) although nothing was recovered");
   });
 });
 

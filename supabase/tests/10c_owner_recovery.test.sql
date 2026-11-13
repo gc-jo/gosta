@@ -4,7 +4,7 @@
 -- Everything runs as postgres, like the dashboard's SQL editor (which bypasses the app's access rules);
 -- the seeded owner is '100' with password 'correct horse battery'.
 begin;
-select plan(56);
+select plan(62);
 
 create schema t12c;
 create function t12c.owner_id() returns uuid language sql stable as $$ select id from app_users where role = 'owner' $$;
@@ -70,6 +70,7 @@ select is(t12c.live(), 3::bigint, 'three live owner sessions before the recovery
 create table t12c.before as select t12c.cv() as cv, (select auth_user_id from app_users where role = 'owner') as auth_id;
 create table t12c.snap as
 select (select secret_hash from app_user_secrets where user_id = t12c.owner_id()) as hash, t12c.cv() as cv, t12c.live() as live;
+create table t12c.audit as select count(*) as n from activity_log where action = 'OWNER_PASSWORD_RECOVERY';
 create function t12c.unchanged() returns boolean language sql stable as
 $$ select (select secret_hash from app_user_secrets where user_id = t12c.owner_id()) = (select hash from t12c.snap)
       and t12c.cv() = (select cv from t12c.snap) and t12c.live() = (select live from t12c.snap) $$;
@@ -150,6 +151,38 @@ on conflict (user_id) do update set secret_hash = excluded.secret_hash;
 $q$, 'P0001', 'SECRET_INVALID', 'runbook 2 statement 4: a password with a control character is refused');
 select is(t12c.unchanged(), true, 'nothing changed');
 
+-- zero owner rows (the owner made a manager for the moment: role and branch change together, as the constraint demands)
+update app_users set role = 'manager', branch_id = 'BR-01' where employee_number = '100';
+select lives_ok($q$
+select set_config('recovery.new_password', $pw$brand new owner pass 123$pw$, true);
+$q$, 'statement 2 with a real password, no owner row exists');
+select throws_ok($q$
+do $guard$
+begin
+  if (select count(*) from app_users where role = 'owner') <> 1 then
+    raise exception 'STOP: expected exactly one owner row. Nothing was changed.';
+  end if;
+  if current_setting('recovery.new_password') = 'PUT-NEW-' || 'PASSWORD-HERE' then
+    raise exception 'STOP: the placeholder was not replaced with a new password. Nothing was changed.';
+  end if;
+end
+$guard$;
+$q$, 'P0001', 'STOP: expected exactly one owner row. Nothing was changed.', 'runbook 2 statement 3: the guard stops on zero owner rows');
+update app_users set role = 'owner', branch_id = null where employee_number = '100';
+select is(t12c.unchanged(), true, 'nothing changed (zero owners)');
+
+-- a password over 72 bytes (73 ASCII characters) is refused by statement 4
+select lives_ok($q$
+select set_config('recovery.new_password', $pw$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$pw$, true);
+$q$, 'statement 2 with a 73-byte password');
+select throws_ok($q$
+insert into app_user_secrets (user_id, secret_hash)
+select id, extensions.crypt(app.clean_secret('owner', current_setting('recovery.new_password')), extensions.gen_salt('bf', 10))
+from app_users where role = 'owner'
+on conflict (user_id) do update set secret_hash = excluded.secret_hash;
+$q$, 'P0001', 'SECRET_TOO_LONG', 'runbook 2 statement 4: a password over 72 bytes is refused');
+select is(t12c.unchanged(), true, 'nothing changed (too long)');
+
 -- the real run
 select lives_ok($q$
 select set_config('recovery.new_password', $pw$brand new owner pass 123$pw$, true);
@@ -213,7 +246,7 @@ select is((select credential_version from (select employee_number,
 from app_users u
 where role = 'owner') q), (select cv + 1 from t12c.before), 'and credential_version one higher');
 select is((select locked_until is null and failed_attempts = 0 from app_users where role = 'owner'), true, 'the lock and the counter are cleared');
-select is((select count(*) from activity_log where action = 'OWNER_PASSWORD_RECOVERY' and user_id = t12c.owner_id()), 1::bigint, 'one OWNER_PASSWORD_RECOVERY row is logged for the owner');
+select is((select count(*) from activity_log where action = 'OWNER_PASSWORD_RECOVERY' and user_id = t12c.owner_id()), (select n + 1 from t12c.audit), 'exactly one OWNER_PASSWORD_RECOVERY row was added for the owner');
 select isnt((select secret_hash from app_user_secrets where user_id = t12c.owner_id()), (select hash from t12c.snap), 'the stored hash changed');
 select is(t12c.live(), 0::bigint, 'every prior owner session is revoked');
 select is(t12c.cv(), (select cv + 1 from t12c.before), 'credential_version rose by 1');
