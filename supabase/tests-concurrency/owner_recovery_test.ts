@@ -619,7 +619,8 @@ Deno.test("runbook block loader: splits respecting dollar quotes and fails loudl
   must(good.replace("select set_config('recovery.new_password'", "select set_config('x'"), "set_config");
   must(good.replace("do $guard$", "do $g$").replace("$guard$;", "$g$;"), "guard");
   must(good.replace("commit;", "select 2;\ncommit;"), "expected begin");
-  must(good.replace("update c set d = 2 where current_setting('recovery.new_password') <> '';", "update c set d = 2;"), "statement 6");
+  must(good.replace("update c set d = 2 where current_setting('recovery.new_password') <> '';", "update c set d = 2;"), "statement 5");
+  must(good.replace("update e set f = 3 where current_setting('recovery.new_password') <> '';", "update e set f = 3;"), "statement 6");
   must(good.replace("select 1 where current_setting('recovery.new_password') <> '';", "select 1;"), "statement 7");
 });
 Deno.test("splitSql: quotes, doubled quotes, comments and dollar bodies", () => {
