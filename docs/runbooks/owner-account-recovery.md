@@ -25,60 +25,61 @@ This does not change the password and does not end any session.
 
 ## 2. Password lost
 
-Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain the three characters `$pw` anywhere (they would end the quoting early; the block then stops with a syntax error and changes nothing). Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
+Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain the character sequences `$pw` or `$recovery` (they would end the quoting early; the block then stops with a syntax error and changes nothing). Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
 
-Type the new password **once**, in statement 2, between the two `$pw$` markers, replacing `PUT-NEW-PASSWORD-HERE`. Nothing between the markers needs escaping: quotes and backslashes are taken literally. Change nothing else.
+Type the new password **once**, between the two `$pw$` markers, replacing `PUT-NEW-PASSWORD-HERE`. Nothing between the markers needs escaping: quotes and backslashes are taken literally. Change nothing else.
 
 First run the check query shown after the block and note the owner's `credential_version`.
 
-Then run the whole block as one unit, exactly as written. It is a single transaction. Its first statement takes a lock on the owner's row. A login with the old password cannot get past the block: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended by statement 6. Do not run the statements one at a time and do not remove or move the first one: without it a login in progress can leave a working session behind. Statements 5, 6 and 7 each check that the password from statement 2 is still present in the same transaction, so if an editor were to run the statements separately they change nothing instead of signing the owner out and recording a recovery that did not happen.
+Then run the block. All the work is done by **one statement** (the `do` block), so it either happens completely or not at all, however the editor sends it: as one request, statement by statement, or continuing after an error. Inside it, the first thing that happens is a lock on the owner's row. A login with the old password cannot get past it: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended when the sessions are revoked.
 
 ```sql
 begin;
 
--- 1. lock the owner's row first; everything below happens under this lock
-select id from app_users where role = 'owner' for update;
-
--- 2. the new password, typed once, between the two $pw$ markers
-select set_config('recovery.new_password', $pw$PUT-NEW-PASSWORD-HERE$pw$, true);
-
--- 3. stop here unless there is exactly one owner and the placeholder was replaced
-do $guard$
+do $recovery$
+declare
+  v_new   text := $pw$PUT-NEW-PASSWORD-HERE$pw$;
+  v_count integer;
+  v_owner uuid;
 begin
-  if (select count(*) from app_users where role = 'owner') <> 1 then
-    raise exception 'STOP: expected exactly one owner row. Nothing was changed.';
+  -- there must be exactly one owner
+  select count(*) into v_count from app_users where role = 'owner';
+  if v_count <> 1 then
+    raise exception 'STOP: expected exactly one owner row, found %. Nothing was changed.', v_count;
   end if;
-  if current_setting('recovery.new_password') = 'PUT-NEW-' || 'PASSWORD-HERE' then
+
+  -- lock the owner's row first; everything below happens under this lock
+  select id into v_owner from app_users where role = 'owner' for update;
+
+  -- the placeholder must have been replaced
+  if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
     raise exception 'STOP: the placeholder was not replaced with a new password. Nothing was changed.';
   end if;
+
+  -- store the new password (refused, and everything undone, if it breaks the rules above)
+  insert into app_user_secrets (user_id, secret_hash)
+  values (v_owner, extensions.crypt(app.clean_secret('owner', v_new), extensions.gen_salt('bf', 10)))
+  on conflict (user_id) do update set secret_hash = excluded.secret_hash;
+
+  -- invalidate logins in flight and clear any lock
+  update app_users
+  set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
+  where id = v_owner;
+
+  -- end every existing owner session
+  update app_sessions
+  set revoked_at = clock_timestamp()
+  where user_id = v_owner and revoked_at is null;
+
+  -- record that this was done
+  perform app.log_action(v_owner, 'OWNER_PASSWORD_RECOVERY', 'app_users', v_owner::text, '{"via": "runbook"}'::jsonb);
 end
-$guard$;
-
--- 4. store the new password (refused, and the whole block undone, if it breaks the rules above)
-insert into app_user_secrets (user_id, secret_hash)
-select id, extensions.crypt(app.clean_secret('owner', current_setting('recovery.new_password')), extensions.gen_salt('bf', 10))
-from app_users where role = 'owner'
-on conflict (user_id) do update set secret_hash = excluded.secret_hash;
-
--- 5. invalidate logins in flight and clear any lock
-update app_users
-set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
-where role = 'owner' and current_setting('recovery.new_password') <> '';
-
--- 6. end every existing owner session
-update app_sessions
-set revoked_at = clock_timestamp()
-where user_id = (select id from app_users where role = 'owner') and revoked_at is null
-  and current_setting('recovery.new_password') <> '';
-
--- 7. record that this was done
-select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb)
-where current_setting('recovery.new_password') <> '';
+$recovery$;
 
 commit;
 ```
 
-**Seeing `COMMIT` is not proof, and the editor may not show it at all.** If any statement reports an error (including a line starting with `STOP:`), the password was **not** changed: run `rollback;` and start again. Statement 2 shows the password back in its result; that is expected. Before the block, and again after a run with no error, run this check query:
+**Do not trust what the editor displays.** It may show `COMMIT`, a notice, an error, or nothing. Whatever it showed, run this check query again:
 
 ```sql
 select employee_number,
@@ -89,9 +90,12 @@ from app_users u
 where role = 'owner';
 ```
 
-After the block it must return exactly one row, with `live_sessions` = 0 and `credential_version` exactly one higher than the value you noted before the block. If the version did not change, the block did not take effect, whatever the editor displayed. The final proof is the next step: the new password signs in and the old one does not. Then sign in to the app with the new password and **change it again from Settings straight away**: the password you typed is kept in the dashboard's query history and may be written to the database's statement and error logs, whether the block succeeded or not.
+- `credential_version` is exactly one higher than the value you noted, and `live_sessions` is 0: the password was changed. (Two higher means the block ran twice; that is harmless, and the password is the one from the last run.)
+- `credential_version` is unchanged: nothing was changed, whatever the editor displayed. If an error was shown (`STOP: …`, `SECRET_WEAK`, `SECRET_TOO_LONG`, `SECRET_INVALID`, or a syntax error), correct the cause and run the block again. If the editor left a transaction open, run `rollback;` first.
 
-What this does not touch: the owner's sign-ins at Supabase Auth itself are not ended. They are useless on their own, because every read and every action in the app checks the app's own session list, which statement 6 has just emptied. This holds as long as nothing is added to the project that trusts a Supabase Auth session without that check.
+The final proof is the next step: sign in to the app with the new password, and confirm the old one is refused. Then **change the password again from Settings straight away**: the password you typed is kept in the dashboard's query history and may be written to the database's statement and error logs, whether the block succeeded or not.
+
+What this does not touch: the owner's sign-ins at Supabase Auth itself are not ended. They are useless on their own, because every read and every action in the app checks the app's own session list, which the block has just emptied. This holds as long as nothing is added to the project that trusts a Supabase Auth session without that check.
 
 ## 3. Someone keeps locking the owner out
 
@@ -111,5 +115,5 @@ The statement above is all that is needed. The owner's Supabase Auth user still 
 
 - There is exactly one row with `role = 'owner'`. Sections 1 and 3 act on every owner row; section 2 refuses to run unless there is exactly one. If the check query returns no row or more than one, stop: do not edit the statements to pick a row by number. That situation is outside this runbook and needs someone who can inspect the data first.
 - The statements are run as the dashboard's database role, which bypasses the app's access rules. Do not run anything else there.
-- **Not yet verified on a hosted project:** that the dashboard's SQL editor sends a pasted block as one request, and that its database role may call `app.clean_secret` and `app.log_action`. Both hold on the local stack used by the automated tests. Rehearse section 2 on the test project before launch (it is on the cutover checklist), and until then treat this procedure as tested locally only.
-- These exact statements are exercised by automated tests: `supabase/tests/10c_owner_recovery.test.sql`, and for section 2 a two-connection test (`supabase/tests-concurrency/owner_recovery_test.ts`) that reads the SQL block straight from this file and proves a login verified before the recovery cannot keep a session after it. If a statement here is changed, run both.
+- **Not verified on a hosted project, and not verified for the dashboard's SQL editor anywhere.** The automated tests send the block from a test program to the local stack; no SQL editor is involved, locally or hosted. Section 2 is written so that it does not depend on how an editor sends it (one statement does all the work), and the tests cover one request, separate requests, autocommit and continue-after-error. Still to be checked by hand on the test project before launch (it is on the cutover checklist): that the dashboard's database role may run the block (it calls `app.clean_secret` and `app.log_action`), what the editor displays on success and on each kind of error, and that the check query and a real sign-in confirm the result.
+- These exact statements are exercised by automated tests on the local stack: `supabase/tests/10c_owner_recovery.test.sql`, and for section 2 a two-connection test (`supabase/tests-concurrency/owner_recovery_test.ts`) that reads the SQL block straight from this file and proves a login verified before the recovery cannot keep a session after it. If a statement here is changed, run both.
