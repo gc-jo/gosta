@@ -104,6 +104,12 @@ function splitAndCheck(sql: string): string[] {
   }
   if (!stmts[2]?.startsWith("select set_config('recovery.new_password'")) throw new Error("runbook block: statement 2 must be the set_config of recovery.new_password");
   if (!/^do \$guard\$/.test(stmts[3] ?? "")) throw new Error("runbook block: statement 3 must be the do $guard$ block");
+  // statements 5, 6 and 7 (version bump, revocation, audit row) must refuse to act outside the block's transaction
+  for (const i of [5, 6, 7]) {
+    if (!(stmts[i] ?? "").includes("current_setting('recovery.new_password')")) {
+      throw new Error(`runbook block: statement ${i} must contain current_setting('recovery.new_password') so that it does nothing outside the block`);
+    }
+  }
   if (stmts.length !== 9) throw new Error(`runbook block: expected begin + 7 statements + commit, got ${stmts.length} statements`);
   return stmts;
 }
@@ -514,46 +520,86 @@ Deno.test("single request: a session registered before the request is revoked by
   });
 });
 
-// HAZARD, documented behaviour (not a guard): what happens when an auto-committing editor runs each statement of the
-// block as its own request, each on a different connection, i.e. NOT in one session and not in one transaction.
-Deno.test("HAZARD: each statement of the block sent as its own autocommit request on a fresh connection (not one session)", async () => {
+// ---- the statements run OUTSIDE the block's single transaction ----------------------------------------------------------
+// Since the runbook hardening, statements 5-7 carry current_setting('recovery.new_password') <> '' and so do nothing
+// unless statement 2 set the password in the same transaction.
+type Full = { hash: string; version: number; failed: number; locked: string | null; sessions: string; audits: number };
+async function fullSnapshot(setup: Conn): Promise<Full> {
+  const o = (await setup.unsafe(
+    `select s.secret_hash as hash, u.credential_version as version, u.failed_attempts as failed, u.locked_until::text as locked,
+            (select coalesce(string_agg(a.session_id::text || ':' || coalesce(a.revoked_at::text, '-'), ',' order by a.session_id), '')
+               from app_sessions a where a.user_id = u.id) as sessions,
+            (select count(*)::int from activity_log where action = 'OWNER_PASSWORD_RECOVERY') as audits
+       from app_users u join app_user_secrets s on s.user_id = u.id where u.role = 'owner'`))[0] as unknown as Full;
+  return o;
+}
+const LABELS = ["begin", "lock", "set_config", "guard", "secret", "version bump", "revoke sessions", "audit row", "commit"];
+/** Runs one statement and describes what happened: "ok rows=N" or "ERROR <message>". */
+async function runOne(c: Conn, sql: string): Promise<{ text: string; error: boolean; rows: number }> {
+  try {
+    const res = await c.unsafe(sql);
+    return { text: `ok rows=${res.count ?? res.length}`, error: false, rows: Number(res.count ?? res.length) };
+  } catch (e) {
+    return { text: `ERROR ${(e as Error).message}`, error: true, rows: 0 };
+  }
+}
+
+Deno.test("statements run separately on fresh connections change nothing (every statement after the first either fails or affects no rows)", async () => {
   await withOwner(async ({ setup, l, owner }) => {
     const stmts = await block();
-    const audits = await auditCount(setup);
+    const before = await fullSnapshot(setup);
     const outcomes: string[] = [];
     for (const [i, sql] of stmts.entries()) {
       const c = connect(); // a fresh connection per statement: no shared transaction, no shared settings
       try {
-        await c.unsafe(sql);
-        outcomes.push(`${i}: ok`);
-      } catch (e) {
-        outcomes.push(`${i}: ERROR ${(e as Error).message}`);
+        const o = await runOne(c, sql);
+        outcomes.push(`${i} ${LABELS[i]}: ${o.text}`);
+        if (i >= 3 && i <= 7) assert(o.error || o.rows === 0, `statement ${i} must fail or affect no rows, got ${o.text}`);
       } finally {
         await c.end({ timeout: 5 }).catch(() => {});
       }
     }
-    console.log("HAZARD outcomes per statement (0 begin, 1 lock, 2 set_config, 3 guard, 4 secret, 5 version, 6 sessions, 7 log, 8 commit):\n  " + outcomes.join("\n  "));
+    console.log("SEPARATE FRESH CONNECTIONS, per statement:\n  " + outcomes.join("\n  "));
+    assertEquals(await fullSnapshot(setup), before, "hash, version, lock fields, every session and the audit log are exactly as before");
+    assertEquals((await verifyAs(l, SEEDED)).ok, true, "the old password still verifies");
+    assertEquals(before.version, owner.credential_version);
+  });
+});
+
+Deno.test("statements run one by one on ONE connection in autocommit mode (no begin/commit) change nothing", async () => {
+  await withOwner(async ({ setup, r, l }) => {
+    const stmts = await block();
+    const before = await fullSnapshot(setup);
+    const outcomes: string[] = [];
+    for (let i = 1; i <= 7; i++) { // begin and commit left out: every statement commits by itself
+      const o = await runOne(r, stmts[i]);
+      outcomes.push(`${i} ${LABELS[i]}: ${o.text}`);
+      if (i >= 4 && i <= 7) assert(o.error || o.rows === 0, `statement ${i} must fail or affect no rows, got ${o.text}`);
+    }
+    console.log("SEPARATE, ONE CONNECTION, AUTOCOMMIT, per statement:\n  " + outcomes.join("\n  "));
+    assertEquals(await fullSnapshot(setup), before, "everything is exactly as before");
+    assertEquals((await verifyAs(l, SEEDED)).ok, true, "the old password still verifies");
+  });
+});
+
+Deno.test("statements sent one by one on one connection WITH begin and commit as separate requests are a real transaction and succeed", async () => {
+  await withOwner(async ({ setup, r, l, owner }) => {
+    const stmts = await block();
+    const before = await fullSnapshot(setup);
+    for (const sql of stmts) await r.unsafe(sql); // begin; ...; commit; each its own request, same session
+    const after = await fullSnapshot(setup);
     const row = (await setup.unsafe(CHECK_QUERY))[0] as unknown as { credential_version: number; live_sessions: string | number };
-    const after = {
-      version: row.credential_version - owner.credential_version,
-      live_sessions: Number(row.live_sessions),
-      audits: (await auditCount(setup)) - audits,
-      old_password_still_works: (await verifyAs(l, SEEDED)).ok,
-    };
-    console.log("HAZARD state afterwards:", JSON.stringify(after));
-    // what the reviewer predicted, asserted as it actually happens:
-    assertStringIncludes(outcomes[3], "ERROR", "the guard (or at the latest the store) fails: the transaction-local setting is gone");
-    assertStringIncludes(outcomes[4], "ERROR", "the password is never stored");
-    assertEquals(after.old_password_still_works, true, "the old password still works");
-    assertEquals(after.version, 1, "but the version was bumped (statement 5 ran)");
-    assertEquals(after.live_sessions, 0, "every owner session was revoked (statement 6 ran)");
-    assertEquals(after.audits, 1, "and a recovery audit row was written (statement 7 ran) although nothing was recovered");
+    assertEquals(row.credential_version, owner.credential_version + 1, "version +1");
+    assertEquals(Number(row.live_sessions), 0, "every owner session revoked");
+    assertEquals(after.audits, before.audits + 1, "exactly one OWNER_PASSWORD_RECOVERY row");
+    assertEquals((await verifyAs(l, NEW_PW)).ok, true, "the new password works");
+    assertEquals((await verifyAs(l, SEEDED)).ok, false, "the old one does not");
   });
 });
 
 // ---- the loader ---------------------------------------------------------------------------------------------------------
 Deno.test("runbook block loader: splits respecting dollar quotes and fails loudly on a wrong shape", () => {
-  const good = "## 1. x\n\n## 2. Password lost\n\n```sql\nbegin;\n-- c\nselect id from app_users where role = 'owner' for update;\nselect set_config('recovery.new_password', $pw$PUT-NEW-PASSWORD-HERE$pw$, true);\ndo $guard$\nbegin\n  if 1 = 2 then raise exception 'STOP: x'; end if;\nend\n$guard$;\nupdate a set b = 1;\nupdate c set d = 2;\nupdate e set f = 3;\nselect 1;\ncommit;\n```\n\n## 3. next\n";
+  const good = "## 1. x\n\n## 2. Password lost\n\n```sql\nbegin;\n-- c\nselect id from app_users where role = 'owner' for update;\nselect set_config('recovery.new_password', $pw$PUT-NEW-PASSWORD-HERE$pw$, true);\ndo $guard$\nbegin\n  if 1 = 2 then raise exception 'STOP: x'; end if;\nend\n$guard$;\nupdate a set b = 1;\nupdate c set d = 2 where current_setting('recovery.new_password') <> '';\nupdate e set f = 3 where current_setting('recovery.new_password') <> '';\nselect 1 where current_setting('recovery.new_password') <> '';\ncommit;\n```\n\n## 3. next\n";
   const s = loadRecoveryBlock(good, "a;b'c$d");
   assertEquals(s.length, 9);
   assertStringIncludes(s[2], "$pw$a;b'c$d$pw$");
@@ -572,7 +618,9 @@ Deno.test("runbook block loader: splits respecting dollar quotes and fails loudl
   must(good.replace("$pw$PUT-NEW-PASSWORD-HERE$pw$", "'PUT-NEW-PASSWORD-HERE'"), "$pw$");
   must(good.replace("select set_config('recovery.new_password'", "select set_config('x'"), "set_config");
   must(good.replace("do $guard$", "do $g$").replace("$guard$;", "$g$;"), "guard");
-  must(good.replace("select 1;\ncommit", "commit"), "expected begin");
+  must(good.replace("commit;", "select 2;\ncommit;"), "expected begin");
+  must(good.replace("update c set d = 2 where current_setting('recovery.new_password') <> '';", "update c set d = 2;"), "statement 6");
+  must(good.replace("select 1 where current_setting('recovery.new_password') <> '';", "select 1;"), "statement 7");
 });
 Deno.test("splitSql: quotes, doubled quotes, comments and dollar bodies", () => {
   assertEquals(splitSql("select 'a;b'; select 'it''s;'; -- x;\nselect $q$;$q$;"), ["select 'a;b'", "select 'it''s;'", "select $q$;$q$"]);

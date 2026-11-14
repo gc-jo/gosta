@@ -4,7 +4,7 @@
 -- Everything runs as postgres, like the dashboard's SQL editor (which bypasses the app's access rules);
 -- the seeded owner is '100' with password 'correct horse battery'.
 begin;
-select plan(62);
+select plan(70);
 
 create schema t12c;
 create function t12c.owner_id() returns uuid language sql stable as $$ select id from app_users where role = 'owner' $$;
@@ -74,6 +74,51 @@ create table t12c.audit as select count(*) as n from activity_log where action =
 create function t12c.unchanged() returns boolean language sql stable as
 $$ select (select secret_hash from app_user_secrets where user_id = t12c.owner_id()) = (select hash from t12c.snap)
       and t12c.cv() = (select cv from t12c.snap) and t12c.live() = (select live from t12c.snap) $$;
+
+-- statements 5, 6 and 7 outside the block's transaction: they must change nothing.
+-- (a) the setting does not exist in this session yet (this file has not called set_config before this point; this is what a
+--     statement run on a fresh connection sees): each statement RAISES "unrecognized configuration parameter" (42704).
+-- (b) the setting exists but is empty (what a session sees after the block's transaction ended): each statement runs and
+--     matches no row, and the audit statement returns no row.
+create table t12c.snap2 as
+select failed_attempts as fa, locked_until is not null as locked, (select count(*) from activity_log where action = 'OWNER_PASSWORD_RECOVERY') as audits
+from app_users where role = 'owner';
+create function t12c.unchanged2() returns boolean language sql stable as
+$$ select t12c.unchanged()
+      and (select failed_attempts from app_users where role = 'owner') = (select fa from t12c.snap2)
+      and (select locked_until is not null from app_users where role = 'owner') = (select locked from t12c.snap2)
+      and (select count(*) from activity_log where action = 'OWNER_PASSWORD_RECOVERY') = (select audits from t12c.snap2) $$;
+select throws_ok($q$
+update app_users
+set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
+where role = 'owner' and current_setting('recovery.new_password') <> '';
+$q$, '42704', null, 'setting absent: statement 5 raises');
+select throws_ok($q$
+update app_sessions
+set revoked_at = clock_timestamp()
+where user_id = (select id from app_users where role = 'owner') and revoked_at is null
+  and current_setting('recovery.new_password') <> '';
+$q$, '42704', null, 'setting absent: statement 6 raises');
+select throws_ok($q$
+select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb)
+where current_setting('recovery.new_password') <> '';
+$q$, '42704', null, 'setting absent: statement 7 raises');
+select is(t12c.unchanged2(), true, 'setting absent: version, lock fields, sessions, hash and audit rows unchanged');
+select set_config('recovery.new_password', '', true);
+select lives_ok($q$
+update app_users
+set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
+where role = 'owner' and current_setting('recovery.new_password') <> '';
+$q$, 'setting empty: statement 5 runs and matches nothing');
+select lives_ok($q$
+update app_sessions
+set revoked_at = clock_timestamp()
+where user_id = (select id from app_users where role = 'owner') and revoked_at is null
+  and current_setting('recovery.new_password') <> '';
+$q$, 'setting empty: statement 6 runs and matches nothing');
+select is((select count(*) from (select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb)
+where current_setting('recovery.new_password') <> '') q), 0::bigint, 'setting empty: statement 7 returns no row and writes no audit row');
+select is(t12c.unchanged2(), true, 'setting empty: version, lock fields, sessions, hash and audit rows unchanged');
 
 select lives_ok($q$
 select id from app_users where role = 'owner' for update;
@@ -208,15 +253,17 @@ $q$, 'runbook 2 statement 4: store the new password');
 select lives_ok($q$
 update app_users
 set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null
-where role = 'owner';
+where role = 'owner' and current_setting('recovery.new_password') <> '';
 $q$, 'runbook 2 statement 5: advance the version');
 select lives_ok($q$
 update app_sessions
 set revoked_at = clock_timestamp()
-where user_id = (select id from app_users where role = 'owner') and revoked_at is null;
+where user_id = (select id from app_users where role = 'owner') and revoked_at is null
+  and current_setting('recovery.new_password') <> '';
 $q$, 'runbook 2 statement 6: end every owner session');
 select lives_ok($q$
-select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb);
+select app.log_action((select id from app_users where role = 'owner'), 'OWNER_PASSWORD_RECOVERY', 'app_users', (select id::text from app_users where role = 'owner'), '{"via": "runbook"}'::jsonb)
+where current_setting('recovery.new_password') <> '';
 $q$, 'runbook 2 statement 7: record the recovery');
 
 select lives_ok($q$
