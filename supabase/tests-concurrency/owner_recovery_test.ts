@@ -1,7 +1,7 @@
 // Owner password recovery (docs/runbooks/owner-account-recovery.md, section 2) on real, separate connections.
 //
 // The SQL under test is NOT copied here: it is read from the runbook file, so the runbook and this test cannot
-// drift apart. The block is `begin; lock; set_config(password); guard; secret; version; sessions; log; commit;`.
+// drift apart. The block is `begin; do $recovery$ ... $recovery$; commit;`: ONE statement does all the work.
 //
 // Connections: R runs the runbook block, L plays a login (verify / register), `admin` only watches pg_stat_activity
 // and pg_blocking_pids, `other` is a third session for lock probes, `setup` is autocommit postgres and does the
@@ -70,14 +70,6 @@ export function splitSql(sql: string): string[] {
   return out;
 }
 
-/**
- * The statements of the fenced sql block under "## 2. Password lost". The placeholder is replaced ONLY inside the
- * $pw$...$pw$ literal of the set_config statement. Fails loudly if the block has the wrong shape.
- */
-export function loadRecoveryBlock(md: string, password: string): string[] {
-  return splitAndCheck(rawRecoveryBlock(md, password));
-}
-
 /** The runbook's sql block exactly as printed (comments included), placeholder replaced only inside the $pw$ literal. */
 export function rawRecoveryBlock(md: string, password: string): string {
   const h = md.indexOf("\n## 2. Password lost");
@@ -95,36 +87,40 @@ export function rawRecoveryBlock(md: string, password: string): string {
   return raw.replace(literal, () => `$pw$${password}$pw$`);
 }
 
-function splitAndCheck(sql: string): string[] {
-  const stmts = splitSql(sql);
-  if (stmts[0]?.toLowerCase() !== "begin") throw new Error("runbook block must start with begin;");
-  if (stmts[stmts.length - 1]?.toLowerCase() !== "commit") throw new Error("runbook block must end with commit;");
-  if (stmts[1] !== "select id from app_users where role = 'owner' for update") {
-    throw new Error("runbook block: the first statement after begin must be the select ... for update on app_users");
+/** begin, the one do statement, commit; fails loudly if the block has the wrong shape. */
+export function loadRecoveryBlock(md: string, password: string): string[] {
+  const stmts = splitSql(rawRecoveryBlock(md, password));
+  if (stmts.length !== 3) throw new Error(`runbook block: expected exactly 3 statements (begin, one do block, commit), got ${stmts.length}`);
+  if (stmts[0].toLowerCase() !== "begin") throw new Error("runbook block must start with begin;");
+  if (stmts[2].toLowerCase() !== "commit") throw new Error("runbook block must end with commit;");
+  const d = stmts[1];
+  if (!/^do \$recovery\$/.test(d) || !d.endsWith("$recovery$")) throw new Error("runbook block: the middle statement must be one do $recovery$ ... $recovery$ block");
+  for (const need of ["'PUT-NEW-' || 'PASSWORD-HERE'", "app.clean_secret('owner'", "credential_version = credential_version + 1", "revoked_at", "app.log_action"]) {
+    if (!d.includes(need)) throw new Error(`runbook block: the do body must contain ${need}`);
   }
-  if (!stmts[2]?.startsWith("select set_config('recovery.new_password'")) throw new Error("runbook block: statement 2 must be the set_config of recovery.new_password");
-  if (!/^do \$guard\$/.test(stmts[3] ?? "")) throw new Error("runbook block: statement 3 must be the do $guard$ block");
-  // statements 5, 6 and 7 (version bump, revocation, audit row) must refuse to act outside the block's transaction
-  for (const i of [5, 6, 7]) {
-    if (!(stmts[i] ?? "").includes("current_setting('recovery.new_password')")) {
-      throw new Error(`runbook block: statement ${i} must contain current_setting('recovery.new_password') so that it does nothing outside the block`);
-    }
+  const lock = d.indexOf("for update");
+  if (lock < 0) throw new Error("runbook block: the do body must lock the owner row with for update");
+  for (const change of ["insert into", "update app_users", "update app_sessions"]) {
+    const at = d.indexOf(change);
+    if (at < 0) throw new Error(`runbook block: the do body must contain ${change}`);
+    if (lock > at) throw new Error(`runbook block: for update must come before the first ${change}`);
   }
-  if (stmts.length !== 9) throw new Error(`runbook block: expected begin + 7 statements + commit, got ${stmts.length} statements`);
   return stmts;
 }
-async function block(password = NEW_PW): Promise<string[]> {
-  return loadRecoveryBlock(await Deno.readTextFile(RUNBOOK), password);
-}
-/** The whole block as the person pastes it: one text, comments and all. */
+const blockOf = async () => await Deno.readTextFile(RUNBOOK);
+/** The whole block as the person pastes it: one text, comments and all (shape-checked first). */
 async function blockText(password = NEW_PW): Promise<string> {
-  const text = rawRecoveryBlock(await Deno.readTextFile(RUNBOOK), password);
-  splitAndCheck(text); // fails loudly on a wrong shape
-  return text;
+  const md = await blockOf();
+  loadRecoveryBlock(md, PLACEHOLDER); // shape check against the template, whatever the password
+  return rawRecoveryBlock(md, password);
+}
+/** begin / the do statement / commit as separate texts. The shape is checked on the template; the password is put in afterwards. */
+async function parts(password = NEW_PW): Promise<{ begin: string; doText: string; commit: string }> {
+  const t = loadRecoveryBlock(await blockOf(), PLACEHOLDER);
+  return { begin: t[0], doText: t[1].replace(`$pw$${PLACEHOLDER}$pw$`, () => `$pw$${password}$pw$`), commit: t[2] };
 }
 /** Sends `text` as ONE simple-protocol message (several statements in one request). */
 const sendWhole = (c: Conn, text: string) => c.unsafe(text).simple().then((x) => x);
-// statement indexes: 0 begin, 1 lock, 2 set_config, 3 guard, 4 secret, 5 version bump, 6 sessions revoked, 7 log, 8 commit
 
 type Owner = {
   id: string; auth_user_id: string; secret_hash: string; credential_version: number;
@@ -166,8 +162,12 @@ async function cleanUp(setup: Conn, o: Owner | null, created: string[]): Promise
 }
 
 type Ctx = { setup: Conn; r: Conn; l: Conn; admin: Conn; other: Conn; owner: Owner; created: string[] };
-/** Opens the connections, runs `fn`, always rolls back and restores the owner, rethrows the first error. */
-async function withOwner(fn: (c: Ctx) => Promise<void>) {
+/**
+ * Opens the connections, optionally primes the lock fields to non-default values (3 failed attempts and a lock one
+ * hour ahead, so that "cleared" and "unchanged" are both visible), runs `fn`, always rolls back and restores the
+ * owner, rethrows the first error.
+ */
+async function withOwner(fn: (c: Ctx) => Promise<void>, opts: { prime?: boolean } = {}) {
   const setup = connect(), r = connect(), l = connect(), admin = connect(), other = connect();
   const created: string[] = [];
   let owner: Owner | null = null;
@@ -175,17 +175,19 @@ async function withOwner(fn: (c: Ctx) => Promise<void>) {
   let restoreError: Error | null = null;
   try {
     owner = await readOwner(setup);
+    if (opts.prime) await setup.unsafe(`update app_users set failed_attempts = 3, locked_until = clock_timestamp() + interval '1 hour' where id = $1`, [owner.id]);
     await fn({ setup, r, l, admin, other, owner, created });
   } catch (e) {
     failure = e;
   } finally {
-    for (const c of [r, l, other]) await rollbackQuietly(c);
+    for (const c of [l, other, r]) await rollbackQuietly(c); // l first: it may hold the lock another connection is waiting for
     restoreError = await cleanUp(setup, owner, created);
     for (const c of [setup, r, l, admin, other]) await c.end({ timeout: 5 }).catch(() => {});
   }
   if (failure) throw failure;
   if (restoreError) throw restoreError;
 }
+const unlock = (setup: Conn, owner: Owner) => setup.unsafe(`update app_users set locked_until = null where id = $1`, [owner.id]);
 
 /** Runs `fn` as service_role inside one committed transaction on `c`. */
 async function asService<T>(c: Conn, fn: () => Promise<T>): Promise<T> {
@@ -212,165 +214,356 @@ async function verifyOk(l: Conn, password = SEEDED): Promise<number> {
 }
 const register = (c: Conn, ownerId: string, sid: string, v: number) =>
   c.unsafe(`select public.login_register_session($1, $2, $3)`, [ownerId, sid, v]);
-const errMsg = (p: Promise<unknown>) => p.then(() => null as Error | null, (e: unknown) => e as Error);
+const errMsg = (p: PromiseLike<unknown>) => p.then(() => null as Error | null, (e: unknown) => e as Error);
 
-type State = { is_new: boolean; is_old: boolean; credential_version: number; unrevoked: number; sid_rows: number; failed_attempts: number };
-async function state(setup: Conn, o: Owner, sid: string, newPw = NEW_PW): Promise<State> {
+/** Everything a recovery may change, in one comparable value. */
+type Full = { hash: string; version: number; failed: number; locked: string | null; sessions: string; audits: number };
+async function fullSnapshot(setup: Conn): Promise<Full> {
   return (await setup.unsafe(
-    `select (extensions.crypt($2, s.secret_hash) = s.secret_hash) as is_new,
-            (extensions.crypt($3, s.secret_hash) = s.secret_hash) as is_old,
-            u.credential_version, u.failed_attempts,
-            (select count(*)::int from app_sessions a where a.user_id = u.id and a.revoked_at is null) as unrevoked,
-            (select count(*)::int from app_sessions a where a.session_id = $4) as sid_rows
-       from app_users u join app_user_secrets s on s.user_id = u.id where u.id = $1`,
-    [o.id, newPw, SEEDED, sid]))[0] as unknown as State;
+    `select s.secret_hash as hash, u.credential_version as version, u.failed_attempts as failed, u.locked_until::text as locked,
+            (select coalesce(string_agg(a.session_id::text || ':' || coalesce(a.revoked_at::text, '-'), ',' order by a.session_id), '')
+               from app_sessions a where a.user_id = u.id) as sessions,
+            (select count(*)::int from activity_log where action = 'OWNER_PASSWORD_RECOVERY') as audits
+       from app_users u join app_user_secrets s on s.user_id = u.id where u.role = 'owner'`))[0] as unknown as Full;
+}
+const passwordMatches = async (setup: Conn, pw: string) =>
+  ((await setup.unsafe(`select (extensions.crypt($1, s.secret_hash) = s.secret_hash) as ok from app_user_secrets s join app_users u on u.id = s.user_id where u.role = 'owner'`, [pw]))[0] as unknown as { ok: boolean }).ok;
+const CHECK_QUERY = `select employee_number, credential_version, locked_until,
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+from app_users u where role = 'owner'`;
+
+/** The normal success, compared with a snapshot taken before; lock fields cleared. `times` = how many recoveries ran. */
+async function assertRecovered(ctx: Ctx, before: Full, pw: string, times = 1) {
+  const { setup, l, owner } = ctx;
+  const after = await fullSnapshot(setup);
+  const rows = await setup.unsafe(CHECK_QUERY);
+  assertEquals(rows.length, 1, "the check query returns exactly one row");
+  const row = rows[0] as unknown as { credential_version: number; live_sessions: string | number; locked_until: unknown };
+  assertEquals(Number(row.live_sessions), 0, "live_sessions = 0");
+  assertEquals(row.credential_version, owner.credential_version + times, "credential_version up by the number of runs");
+  assertEquals([after.failed, after.locked], [0, null], "failed_attempts and locked_until are cleared");
+  assertEquals(after.audits, before.audits + times, "one OWNER_PASSWORD_RECOVERY row per run");
+  assertEquals(await passwordMatches(setup, pw), true, "the stored hash is the new password");
+  assertEquals((await verifyAs(l, pw)).ok, true, "the new password verifies");
+  assertEquals((await verifyAs(l, SEEDED)).ok, false, "the old password does not");
+}
+/** Nothing changed: the full snapshot is identical, and the old password still verifies. */
+async function assertUnchanged(ctx: Ctx, before: Full, why: string, forbiddenPassword?: string) {
+  const { setup, l, owner } = ctx;
+  assertEquals(await fullSnapshot(setup), before, `${why}: hash, version, lock fields, every session and the audit count are exactly as before`);
+  if (forbiddenPassword !== undefined) assertEquals(await passwordMatches(setup, forbiddenPassword), false, `${why}: the stored hash is not a hash of the refused password`);
+  await unlock(setup, owner); // the lock was primed: lift it so that the old password can be tried
+  assertEquals((await verifyAs(l, SEEDED)).ok, true, `${why}: the old password still verifies`);
+  // a successful login clears the counters: put the primed values back so that the next comparison is meaningful
+  await setup.unsafe(`update app_users set failed_attempts = $2, locked_until = $3::text::timestamptz where id = $1`, [owner.id, before.failed, before.locked]);
 }
 
-// ---- registration arriving while the block runs --------------------------------------------------------------------
-// A login verified before the recovery tries to register while the block is running: R has executed statements 0..stopAfter
-// (the last one run is the boundary), L's registration is started now and must WAIT for R (blocker identity asserted);
-// R then finishes and commits.
-async function registrationDuringBlock(stopAfter: number) {
+// ---- the driver ------------------------------------------------------------------------------------------------------
+Deno.test("the driver really sends one simple-protocol message (several statements in one message work with .simple(); the extended protocol refuses them)", async () => {
+  const c = connect();
+  try {
+    const res = await c.unsafe("select 1 as a; select 2 as b").simple();
+    assertEquals(res.length, 2, "two result sets came back from ONE request: the simple query protocol");
+    const err = await errMsg(c.unsafe("select 1 as a; select $1::int as b", [2]));
+    assert(err !== null, "the same kind of text sent with parameters (extended protocol) is refused");
+    assertStringIncludes(err.message, "multiple commands");
+  } finally {
+    await c.end({ timeout: 5 }).catch(() => {});
+  }
+});
+
+// ---- races with a login -------------------------------------------------------------------------------------------------
+Deno.test("2a. a login verified with the old password before the recovery cannot register after it (USER_INVALID, no session)", async () => {
+  await withOwner(async (ctx) => {
+    const { setup, r, l, owner, created } = ctx;
+    const sid = crypto.randomUUID();
+    created.push(sid);
+    const v = await verifyOk(l); // committed, version v
+    await sendWhole(r, await blockText()); // the whole block, runs to completion and commits
+    const err = await errMsg(asService(l, () => register(l, owner.id, sid, v)));
+    assert(err !== null, "the late registration must be refused");
+    assertStringIncludes(err.message, "USER_INVALID");
+    const n = (await setup.unsafe(`select count(*)::int as n from app_sessions where session_id = $1`, [sid]))[0] as unknown as { n: number };
+    assertEquals(n.n, 0, "no session row");
+    assertEquals(Number(((await setup.unsafe(CHECK_QUERY))[0] as unknown as { live_sessions: number }).live_sessions), 0);
+  });
+});
+
+Deno.test("2b. a registration that arrives while the recovery holds the lock waits for R, then is refused", async () => {
   await withOwner(async ({ setup, r, l, admin, owner, created }) => {
     const sid = crypto.randomUUID();
     created.push(sid);
-    const stmts = await block();
     const v = await verifyOk(l);
-    assertEquals(v, owner.credential_version, "verified with the current version");
+    const { begin, doText, commit } = await parts();
     const pidL = await backendPid(l), pidR = await backendPid(r);
-    for (let i = 0; i <= stopAfter; i++) await r.unsafe(stmts[i]); // R holds the row lock from statement 1 on
-
+    await r.unsafe(begin);
+    await r.unsafe(doText); // the recovery has done everything and holds the lock; no commit yet
     await l.unsafe("begin");
     await l.unsafe("set local role service_role");
     const outcome = errMsg(register(l, owner.id, sid, v));
     await waitUntilBlockedBy(admin, pidL, pidR); // L waits, and for R specifically
-    for (let i = stopAfter + 1; i < stmts.length; i++) await r.unsafe(stmts[i]); // rest of the block, ending with commit
+    await r.unsafe(commit);
     const err = await outcome;
     await rollbackQuietly(l);
-
-    const st = await state(setup, owner, sid);
-    console.log("observed:", JSON.stringify({ stopAfter, err: err?.message ?? null, ...st, originalVersion: owner.credential_version }));
     assert(err !== null, "the registration that was waiting must be refused");
     assertStringIncludes(err.message, "USER_INVALID");
-    assertEquals(st.sid_rows, 0, "no app_sessions row for the refused registration");
-    assertEquals(st.unrevoked, 0, "the owner has no unrevoked session at all");
-    assertEquals(st.is_new, true, "the stored hash matches the new password");
-    assertEquals(st.is_old, false, "and not the old one");
-    assertEquals(st.credential_version, owner.credential_version + 1, "credential_version rose by exactly 1");
-  });
-}
-const BOUNDARIES: Array<[number, string]> = [
-  [1, "right after the lock"], [2, "after the password is put into the setting"], [3, "after the guard"],
-  [4, "after the new secret is stored"], [5, "between the version bump and the revocation"],
-  [6, "after the revocation"], [7, "after the recovery is logged (everything but commit)"],
-];
-for (const [stopAfter, label] of BOUNDARIES) {
-  Deno.test(`recovery block: a login verified before it cannot register ${label} (waits for R, then refused)`, async () => {
-    await registrationDuringBlock(stopAfter);
-  });
-}
-
-Deno.test("recovery block: a login verified with the old password just before the recovery cannot register after it", async () => {
-  await withOwner(async ({ setup, r, l, owner, created }) => {
-    const sid = crypto.randomUUID();
-    created.push(sid);
-    const stmts = await block();
-    const v = await verifyOk(l); // finished (committed) before the block takes its lock
-    for (const s of stmts) await r.unsafe(s);
-    const err = await errMsg(asService(l, () => register(l, owner.id, sid, v)));
-    assert(err !== null, "the late registration must be refused");
-    assertStringIncludes(err.message, "USER_INVALID");
-    const st = await state(setup, owner, sid);
-    assertEquals([st.sid_rows, st.unrevoked, st.credential_version], [0, 0, owner.credential_version + 1]);
+    const n = (await setup.unsafe(`select count(*)::int as n from app_sessions where session_id = $1`, [sid]))[0] as unknown as { n: number };
+    assertEquals(n.n, 0, "no row for that session id");
+    assertEquals(Number(((await setup.unsafe(CHECK_QUERY))[0] as unknown as { live_sessions: number }).live_sessions), 0, "no unrevoked owner session");
   });
 });
 
-Deno.test("recovery block: a session registered before the block starts is revoked by it", async () => {
-  await withOwner(async ({ setup, r, l, owner, created }) => {
-    const sid = crypto.randomUUID();
-    created.push(sid);
-    const stmts = await block();
-    const v = await verifyOk(l);
-    await asService(l, () => register(l, owner.id, sid, v)); // committed
-    assertEquals((await state(setup, owner, sid)).sid_rows, 1, "the session exists before the recovery");
-    for (const s of stmts) await r.unsafe(s);
-    const row = (await setup.unsafe(`select revoked_at is not null as revoked from app_sessions where session_id = $1`, [sid]))[0] as unknown as { revoked: boolean };
-    assertEquals(row.revoked, true, "that session is revoked by the block");
-    assertEquals((await state(setup, owner, sid)).unrevoked, 0, "no live owner session remains");
-  });
-});
-
-// ---- login_verify racing the block ---------------------------------------------------------------------------------
-Deno.test("recovery block: a login_verify with the OLD password that arrives during the block waits for R and is refused", async () => {
+Deno.test("2c. a registration that holds the row lock FIRST makes the recovery wait for L, and the session it registered is then revoked", async () => {
   await withOwner(async ({ setup, r, l, admin, owner, created }) => {
     const sid = crypto.randomUUID();
     created.push(sid);
-    const stmts = await block();
+    const v = await verifyOk(l);
     const pidL = await backendPid(l), pidR = await backendPid(r);
-    for (let i = 0; i < stmts.length - 1; i++) await r.unsafe(stmts[i]); // everything but commit
+    await l.unsafe("begin");
+    await l.unsafe("set local role service_role");
+    await register(l, owner.id, sid, v).then((x) => x); // succeeds, NOT committed: L holds the owner row lock and an uncommitted session row
+    const { begin, doText, commit } = await parts();
+    await r.unsafe(begin);
+    const recovery = errMsg(r.unsafe(doText).then((x) => x));
+    await waitUntilBlockedBy(admin, pidR, pidL); // the recovery waits, for L specifically
+    await l.unsafe("commit");
+    assertEquals(await recovery, null, "the recovery completes once L has committed");
+    await r.unsafe(commit);
+    const row = (await setup.unsafe(`select revoked_at is not null as revoked from app_sessions where session_id = $1`, [sid]))[0] as unknown as { revoked: boolean };
+    assertEquals(row.revoked, true, "the session L registered is revoked: the block's revocation saw it");
+    assertEquals(Number(((await setup.unsafe(CHECK_QUERY))[0] as unknown as { live_sessions: number }).live_sessions), 0);
+  });
+});
+
+Deno.test("2d. login_verify with the OLD password during the recovery waits for R and is refused (failed_attempts 1)", async () => {
+  await withOwner(async ({ setup, r, l, admin, owner }) => {
+    const { begin, doText, commit } = await parts();
+    const pidL = await backendPid(l), pidR = await backendPid(r);
+    await r.unsafe(begin);
+    await r.unsafe(doText);
     await l.unsafe("begin");
     await l.unsafe("set local role service_role");
     const outcome = l.unsafe(`select public.login_verify('100', $1) as r`, [SEEDED]).then((rows) => rows); // .then starts the lazy query
     await waitUntilBlockedBy(admin, pidL, pidR);
-    await r.unsafe(stmts[stmts.length - 1]); // commit
-    const res = ((await outcome)[0] as unknown as { r: Verify & { locked_until: unknown } }).r;
+    await r.unsafe(commit);
+    const res = ((await outcome)[0] as unknown as { r: Verify }).r;
     await l.unsafe("commit");
-    assertEquals(res.ok, false);
-    assertEquals(res.reason, "invalid", "the old password is wrong once the block has committed");
-    const st = await state(setup, owner, sid);
-    assertEquals(st.failed_attempts, 1, "the refused attempt counted once (the block had cleared the counter)");
-    assertEquals(st.unrevoked, 0, "no session exists");
-    // the new password works, with the new version, and a registration with it succeeds
-    const rv = await verifyAs(l, NEW_PW);
-    assertEquals(rv.ok, true);
-    assertEquals(rv.credential_version, owner.credential_version + 1);
-    await asService(l, () => register(l, owner.id, sid, rv.credential_version!));
-    assertEquals((await state(setup, owner, sid)).sid_rows, 1, "the session of the new login is registered");
+    assertEquals([res.ok, res.reason], [false, "invalid"], "the old password is wrong once the recovery has committed");
+    const st = await fullSnapshot(setup);
+    assertEquals(st.failed, 1, "the refused attempt counted once (the block had cleared the counter)");
+    assertEquals(st.version, owner.credential_version + 1);
   });
 });
 
-// ---- guard and special characters -------------------------------------------------------------------------------------
-Deno.test("recovery block: with the placeholder left in, the guard stops the block, changes nothing and releases the lock at the error", async () => {
-  await withOwner(async ({ setup, r, other, owner }) => {
-    const stmts = await block(PLACEHOLDER); // the loader leaves the literal as it is in the runbook
-    for (let i = 0; i <= 2; i++) await r.unsafe(stmts[i]);
-    const err = await errMsg(r.unsafe(stmts[3]));
-    assert(err !== null, "the guard must raise");
-    assertStringIncludes(err.message, "STOP:");
-    assertStringIncludes(err.message, "placeholder");
-    // the transaction is aborted but not yet rolled back: its row lock is already gone
+Deno.test("2d. login_verify with the NEW password during the recovery waits for R, then succeeds with the new version", async () => {
+  await withOwner(async ({ r, l, admin, owner }) => {
+    const { begin, doText, commit } = await parts();
+    const pidL = await backendPid(l), pidR = await backendPid(r);
+    await r.unsafe(begin);
+    await r.unsafe(doText);
+    await l.unsafe("begin");
+    await l.unsafe("set local role service_role");
+    const outcome = l.unsafe(`select public.login_verify('100', $1) as r`, [NEW_PW]).then((rows) => rows);
+    await waitUntilBlockedBy(admin, pidL, pidR);
+    await r.unsafe(commit);
+    const res = ((await outcome)[0] as unknown as { r: Verify }).r;
+    await l.unsafe("commit");
+    assertEquals(res.ok, true);
+    assertEquals(res.credential_version, owner.credential_version + 1);
+  });
+});
+
+Deno.test("2e. the lock comes before any change: while the recovery waits for L's row lock it holds no RowExclusiveLock on app_user_secrets, app_sessions or app_users", async () => {
+  await withOwner(async (ctx) => {
+    const { setup, r, l, admin } = ctx;
+    const before = await fullSnapshot(setup);
+    const pidL = await backendPid(l), pidR = await backendPid(r);
+    await l.unsafe("begin");
+    await l.unsafe("select id from app_users where role = 'owner' for update"); // L holds the owner row
+    const recovery = errMsg(sendWhole(r, await blockText())); // the whole block, one request
+    await waitUntilBlockedBy(admin, pidR, pidL);
+    const locks = await admin.unsafe(
+      `select l.locktype, l.mode, l.granted, c.relname
+         from pg_locks l left join pg_class c on c.oid = l.relation where l.pid = ${Number(pidR)}`) as unknown as
+      Array<{ locktype: string; mode: string; granted: boolean; relname: string | null }>;
+    console.log("R's locks while waiting:", JSON.stringify(locks.map((x) => [x.locktype, x.mode, x.granted, x.relname])));
+    const writes = locks.filter((x) => x.mode === "RowExclusiveLock" && ["app_user_secrets", "app_sessions", "app_users"].includes(x.relname ?? ""));
+    assertEquals(writes, [], "R has not started any insert or update: no RowExclusiveLock on the three tables");
+    assert(locks.some((x) => !x.granted && (x.locktype === "tuple" || x.locktype === "transactionid")), "R is waiting for a tuple/transaction lock (the owner row held by L)");
+    assertEquals((await fullSnapshot(setup)).hash, before.hash, "nothing has been stored yet");
+    await l.unsafe("rollback");
+    assertEquals(await recovery, null, "once L lets go the recovery completes");
+    await assertRecovered(ctx, before, NEW_PW);
+  });
+});
+
+// ---- all-or-nothing, in every client mode --------------------------------------------------------------------------------
+Deno.test("f1. one multi-statement request: success; lock fields cleared, one audit row, check query one row", async () => {
+  await withOwner(async (ctx) => {
+    const before = await fullSnapshot(ctx.setup);
+    assertEquals([before.failed, before.locked !== null], [3, true], "the lock fields are primed");
+    await sendWhole(ctx.r, await blockText());
+    await assertRecovered(ctx, before, NEW_PW);
+  }, { prime: true });
+});
+
+/** The whole block as one request fails with `expected`, leaves an aborted transaction without a lock, and changed nothing. */
+async function singleRequestRefused(pw: string, expected: string) {
+  await withOwner(async (ctx) => {
+    const { setup, r, other } = ctx;
+    const before = await fullSnapshot(setup);
+    const err = await errMsg(sendWhole(r, await blockText(pw)));
+    assert(err !== null, "the request must fail");
+    assertStringIncludes(err.message, expected);
+    const later = await errMsg(r.unsafe("select 1").then((x) => x));
+    assert(later !== null, "the connection is in an aborted transaction (it refuses further statements) before any rollback");
+    assertStringIncludes(later.message, "aborted");
     await other.unsafe("begin");
     const got = await other.unsafe(`select id from app_users where role = 'owner' for update nowait`);
-    assertEquals(got.length, 1, "another connection can lock the owner row before any rollback");
+    assertEquals(got.length, 1, "the owner row is not locked: a second connection gets it with NOWAIT while r is still aborted");
     await other.unsafe("rollback");
-    const later = await errMsg(r.unsafe("select 1"));
-    assert(later !== null, "the aborted transaction refuses further statements");
     await r.unsafe("rollback");
-    const st = await state(setup, owner, crypto.randomUUID());
-    assertEquals([st.is_old, st.credential_version, st.unrevoked], [true, owner.credential_version, owner.live.length]);
+    assertEquals(((await r.unsafe("select 1 as ok"))[0] as unknown as { ok: number }).ok, 1, "r is usable after the rollback");
+    await assertUnchanged(ctx, before, expected, pw);
+  }, { prime: true });
+}
+Deno.test("f2. one request, placeholder left in: STOP:, nothing changed, no lock left", async () => {
+  await singleRequestRefused(PLACEHOLDER, "STOP: the placeholder was not replaced");
+});
+Deno.test("f3. one request, 10-character password: SECRET_WEAK, nothing changed", async () => {
+  await singleRequestRefused("tenchars12", "SECRET_WEAK");
+});
+Deno.test("f4. one request, 73-byte password: SECRET_TOO_LONG, nothing changed", async () => {
+  await singleRequestRefused("a".repeat(73), "SECRET_TOO_LONG");
+});
+Deno.test("f5. one request, password with a tab: SECRET_INVALID, nothing changed", async () => {
+  await singleRequestRefused("brand new\towner pass 123", "SECRET_INVALID");
+});
+
+Deno.test("f6. begin, the do statement and commit as three separate requests on one session: success", async () => {
+  await withOwner(async (ctx) => {
+    const before = await fullSnapshot(ctx.setup);
+    const { begin, doText, commit } = await parts();
+    for (const sql of [begin, doText, commit]) await ctx.r.unsafe(sql);
+    await assertRecovered(ctx, before, NEW_PW);
+  }, { prime: true });
+});
+
+Deno.test("f7. one session, autocommit, only the do statement (begin and commit skipped): success, atomically, exactly once", async () => {
+  await withOwner(async (ctx) => {
+    const before = await fullSnapshot(ctx.setup);
+    await ctx.r.unsafe((await parts()).doText);
+    await assertRecovered(ctx, before, NEW_PW);
+  }, { prime: true });
+});
+
+Deno.test("f8. each statement on its own fresh connection (begin, do, commit): the do succeeds atomically on its own; begin and commit are harmless", async () => {
+  await withOwner(async (ctx) => {
+    const before = await fullSnapshot(ctx.setup);
+    for (const sql of Object.values(await parts())) {
+      const c = connect();
+      try {
+        await c.unsafe(sql);
+      } finally {
+        await c.end({ timeout: 5 }).catch(() => {});
+      }
+    }
+    await assertRecovered(ctx, before, NEW_PW);
+  }, { prime: true });
+});
+
+Deno.test("f9. continue-on-error / savepoint per statement: a refused block is undone completely, a valid one succeeds", async () => {
+  await withOwner(async (ctx) => {
+    const { setup, r } = ctx;
+    const before = await fullSnapshot(setup);
+    for (const [pw, expected] of [[PLACEHOLDER, "STOP:"], ["tenchars12", "SECRET_WEAK"]] as const) {
+      const { doText } = await parts(pw);
+      await r.unsafe("begin");
+      await r.unsafe("savepoint s1");
+      const err = await errMsg(r.unsafe(doText).then((x) => x));
+      assert(err !== null);
+      assertStringIncludes(err.message, expected);
+      await r.unsafe("rollback to savepoint s1");
+      await r.unsafe("commit"); // the client carries on and commits anyway
+      await assertUnchanged(ctx, before, `savepoint mode, ${expected}`, pw);
+    }
+    // the same wrapping with a valid password: full success
+    const { doText } = await parts();
+    await r.unsafe("begin");
+    await r.unsafe("savepoint s1");
+    await r.unsafe(doText);
+    await r.unsafe("release savepoint s1");
+    await r.unsafe("commit");
+    await assertRecovered(ctx, before, NEW_PW);
+  }, { prime: true });
+});
+Deno.test("f10. the block run twice with two passwords: the second works, the first does not, version +2, two audit rows", async () => {
+  await withOwner(async (ctx) => {
+    const { setup, r, l } = ctx;
+    const before = await fullSnapshot(setup);
+    const FIRST = "first recovery pass 111", SECOND = "second recovery pass 222";
+    await sendWhole(r, await blockText(FIRST));
+    await sendWhole(r, await blockText(SECOND));
+    await assertRecovered(ctx, before, SECOND, 2);
+    assertEquals((await verifyAs(l, FIRST)).ok, false, "the first password no longer works");
+  }, { prime: true });
+});
+
+Deno.test("f11. a session registered before the recovery is revoked by it", async () => {
+  await withOwner(async ({ setup, r, l, owner, created }) => {
+    const sid = crypto.randomUUID();
+    created.push(sid);
+    const v = await verifyOk(l);
+    await asService(l, () => register(l, owner.id, sid, v)); // committed
+    await sendWhole(r, await blockText());
+    const row = (await setup.unsafe(`select revoked_at is not null as revoked from app_sessions where session_id = $1`, [sid]))[0] as unknown as { revoked: boolean };
+    assertEquals(row.revoked, true);
+    assertEquals(Number(((await setup.unsafe(CHECK_QUERY))[0] as unknown as { live_sessions: number }).live_sessions), 0);
   });
 });
 
-Deno.test("recovery block: a password with quote, double quote, backslash, semicolon and a dollar goes through unaltered", async () => {
-  const P = `it's "q"; back\\slash $x$ $$ ok 123`;
-  await withOwner(async ({ setup, r, l, owner }) => {
-    const stmts = await block(P);
-    assertEquals(stmts.length, 9, "semicolons inside the password do not split the block");
-    for (const s of stmts) await r.unsafe(s);
-    const v = await verifyAs(l, P);
-    assertEquals(v.ok, true, "login_verify with exactly that string succeeds");
-    assertEquals(v.credential_version, owner.credential_version + 1);
-    const st = await state(setup, owner, crypto.randomUUID(), P);
-    assertEquals(st.is_new, true);
-    const wrong = await verifyAs(l, P.replace("ok", "ko"));
-    assertEquals(wrong.ok, false, "one changed character is refused");
-  });
+// ---- special characters ---------------------------------------------------------------------------------------------------
+Deno.test("g1. a password with quote, double quote, backslash, semicolon and a dollar goes through unaltered", async () => {
+  const P = `it's "q"; back\\slash $x$ ok 123`;
+  for (const mode of ["single request", "separate requests"]) {
+    await withOwner(async (ctx) => {
+      const before = await fullSnapshot(ctx.setup);
+      if (mode === "single request") await sendWhole(ctx.r, await blockText(P));
+      else for (const sql of Object.values(await parts(P))) await ctx.r.unsafe(sql);
+      await assertRecovered(ctx, before, P);
+      assertEquals((await verifyAs(ctx.l, P.replace("ok", "ko"))).ok, false, "one changed character is refused");
+    }, { prime: true });
+  }
 });
 
-// ---- the old order ----------------------------------------------------------------------------------------------------
-// DEMONSTRATION of the defect the lock closes; it does not guard the runbook (tests above do that).
-Deno.test("DEMONSTRATION, old order in a transaction, no row lock: a verified login keeps its session -- this is why the runbook locks first", async () => {
-  await withOwner(async ({ setup, r, l, admin, owner, created }) => {
+// A password that contains the closing marker of a dollar quote ends the quoting early: the statement is a syntax
+// error and NOTHING is changed (the runbook says so). What the connection looks like afterwards is recorded.
+for (const marker of ["$pw$", "$recovery$"]) {
+  Deno.test(`g2. a password containing ${marker}: syntax error, nothing changed (single request and separate requests)`, async () => {
+    const P = `first${marker}second pass 12345`;
+    await withOwner(async (ctx) => {
+      const before = await fullSnapshot(ctx.setup);
+      const e1 = await errMsg(sendWhole(ctx.r, await blockText(P)));
+      assert(e1 !== null, "the single request fails");
+      console.log(`${marker} single request ->`, e1.message.slice(0, 80));
+      await rollbackQuietly(ctx.r);
+      await assertUnchanged(ctx, before, `${marker} single request`, P);
+      const { begin, doText, commit } = await parts(P);
+      await ctx.r.unsafe(begin);
+      const e2 = await errMsg(ctx.r.unsafe(doText).then((x) => x));
+      assert(e2 !== null, "the do statement fails");
+      console.log(`${marker} separate requests ->`, e2.message.slice(0, 80));
+      await ctx.r.unsafe(commit); // acts as a rollback in the aborted transaction
+      await assertUnchanged(ctx, before, `${marker} separate requests`, P);
+    }, { prime: true });
+  });
+}
+
+// ---- the original defect -----------------------------------------------------------------------------------------------
+// DEMONSTRATION of the defect the lock closes (the first runbook order, merely wrapped in a transaction); it does not
+// guard the current runbook (the tests above do that).
+Deno.test("h. DEMONSTRATION, old order in a transaction, no row lock: a verified login keeps its session -- this is why the runbook locks first", async () => {
+  await withOwner(async ({ setup, r, l, owner, created }) => {
     const sid = crypto.randomUUID();
     created.push(sid);
     const v = await verifyOk(l);
@@ -391,7 +584,6 @@ Deno.test("DEMONSTRATION, old order in a transaction, no row lock: a verified lo
     await l.unsafe("commit");
     await r.unsafe(`update app_users set credential_version = credential_version + 1, failed_attempts = 0, locked_until = null where role = 'owner'`);
     await r.unsafe("commit");
-
     const row = (await setup.unsafe(
       `select revoked_at is null as unrevoked, expires_at > clock_timestamp() as valid from app_sessions where session_id = $1`, [sid]))[0] as unknown as { unrevoked: boolean; valid: boolean };
     console.log("observed (old order):", JSON.stringify(row));
@@ -407,224 +599,38 @@ Deno.test("DEMONSTRATION, old order in a transaction, no row lock: a verified lo
   });
 });
 
-// ---- login_verify with the NEW password racing the block ---------------------------------------------------------------
-Deno.test("recovery block: a login_verify with the NEW password that arrives during the block waits for R, then succeeds with the new version", async () => {
-  await withOwner(async ({ r, l, admin, owner }) => {
-    const stmts = await block();
-    const pidL = await backendPid(l), pidR = await backendPid(r);
-    for (let i = 0; i < stmts.length - 1; i++) await r.unsafe(stmts[i]); // everything but commit
-    await l.unsafe("begin");
-    await l.unsafe("set local role service_role");
-    const outcome = l.unsafe(`select public.login_verify('100', $1) as r`, [NEW_PW]).then((rows) => rows); // .then starts the lazy query
-    await waitUntilBlockedBy(admin, pidL, pidR);
-    await r.unsafe(stmts[stmts.length - 1]); // commit
-    const res = ((await outcome)[0] as unknown as { r: Verify }).r;
-    await l.unsafe("commit");
-    assertEquals(res.ok, true, "the new password verifies once the block has committed");
-    assertEquals(res.credential_version, owner.credential_version + 1);
-  });
-});
-
-// ---- the block as the runbook prescribes: ONE request ---------------------------------------------------------------------
-const CHECK_QUERY = `select employee_number, credential_version, locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
-from app_users u where role = 'owner'`;
-const auditCount = async (c: Conn) =>
-  Number(((await c.unsafe(`select count(*)::int as n from activity_log where action = 'OWNER_PASSWORD_RECOVERY'`))[0] as unknown as { n: number }).n);
-
-Deno.test("single request: the driver really sends one simple-protocol message (several statements in one message work with .simple(); the extended protocol refuses them)", async () => {
-  const c = connect();
-  try {
-    const res = await c.unsafe("select 1 as a; select 2 as b").simple();
-    assertEquals(res.length, 2, "two result sets came back from ONE request: the simple query protocol");
-    // the extended protocol (parse/bind/execute, used when parameters are sent) refuses several statements in one message
-    const err = await errMsg(c.unsafe("select 1 as a; select $1::int as b", [2]).then((x) => x));
-    assert(err !== null, "the same kind of text sent with parameters (extended protocol) is refused");
-    assertStringIncludes(err.message, "multiple commands");
-  } finally {
-    await c.end({ timeout: 5 }).catch(() => {});
-  }
-});
-
-Deno.test("single request: the whole block with a valid password succeeds in one request", async () => {
-  await withOwner(async ({ setup, r, l, owner }) => {
-    const audits = await auditCount(setup);
-    await sendWhole(r, await blockText());
-    const row = (await setup.unsafe(CHECK_QUERY))[0] as unknown as { credential_version: number; live_sessions: string | number };
-    assertEquals((await setup.unsafe(CHECK_QUERY)).length, 1, "the check query returns exactly one row");
-    assertEquals(Number(row.live_sessions), 0);
-    assertEquals(row.credential_version, owner.credential_version + 1);
-    assertEquals((await verifyAs(l, NEW_PW)).ok, true, "the new password verifies");
-    assertEquals((await verifyAs(l, SEEDED)).ok, false, "the old one does not");
-    assertEquals(await auditCount(setup), audits + 1, "exactly one OWNER_PASSWORD_RECOVERY row was added");
-  });
-});
-
-/** Nothing changed and the owner row is not locked by the failed connection `r` (checked from `other`, before any rollback on r). */
-async function assertFailedRequestLeftNothing({ setup, r, other, owner }: Ctx, audits: number, expected: string) {
-  const st = await state(setup, owner, crypto.randomUUID());
-  assertEquals([st.is_old, st.credential_version, st.unrevoked, await auditCount(setup)], [true, owner.credential_version, owner.live.length, audits], `${expected}: nothing changed`);
-  await other.unsafe("begin");
-  const got = await other.unsafe(`select id from app_users where role = 'owner' for update nowait`);
-  assertEquals(got.length, 1, "the owner row is not left locked: another connection locks it with NOWAIT, no rollback sent on r yet");
-  await other.unsafe("rollback");
-  await r.unsafe("rollback"); // only now
-  assertEquals(((await r.unsafe("select 1 as ok"))[0] as unknown as { ok: number }).ok, 1, "the failed connection is usable after rollback");
-}
-
-Deno.test("single request: the placeholder left in stops the block with STOP:, changes nothing and leaves no lock", async () => {
-  await withOwner(async (ctx) => {
-    const audits = await auditCount(ctx.setup);
-    const err = await errMsg(sendWhole(ctx.r, await blockText(PLACEHOLDER)));
-    assert(err !== null, "the request must fail");
-    assertStringIncludes(err.message, "STOP:");
-    assertStringIncludes(err.message, "placeholder");
-    await assertFailedRequestLeftNothing(ctx, audits, "placeholder");
-  });
-});
-
-Deno.test("single request: a 10-character password is refused with SECRET_WEAK, changes nothing and leaves no lock", async () => {
-  await withOwner(async (ctx) => {
-    const audits = await auditCount(ctx.setup);
-    const err = await errMsg(sendWhole(ctx.r, await blockText("tenchars12")));
-    assert(err !== null, "the request must fail");
-    assertStringIncludes(err.message, "SECRET_WEAK");
-    await assertFailedRequestLeftNothing(ctx, audits, "weak password");
-  });
-});
-
-Deno.test("single request: a login verified with the old password before the request cannot register after it", async () => {
-  await withOwner(async ({ setup, r, l, owner, created }) => {
-    const sid = crypto.randomUUID();
-    created.push(sid);
-    const v = await verifyOk(l); // committed
-    await sendWhole(r, await blockText()); // runs to completion and commits by itself
-    const err = await errMsg(asService(l, () => register(l, owner.id, sid, v)));
-    assert(err !== null, "the late registration must be refused");
-    assertStringIncludes(err.message, "USER_INVALID");
-    const st = await state(setup, owner, sid);
-    assertEquals([st.sid_rows, st.unrevoked, st.credential_version], [0, 0, owner.credential_version + 1]);
-  });
-});
-
-Deno.test("single request: a session registered before the request is revoked by it", async () => {
-  await withOwner(async ({ setup, r, l, owner, created }) => {
-    const sid = crypto.randomUUID();
-    created.push(sid);
-    const v = await verifyOk(l);
-    await asService(l, () => register(l, owner.id, sid, v)); // committed
-    await sendWhole(r, await blockText());
-    const row = (await setup.unsafe(`select revoked_at is not null as revoked from app_sessions where session_id = $1`, [sid]))[0] as unknown as { revoked: boolean };
-    assertEquals(row.revoked, true);
-    assertEquals((await state(setup, owner, sid)).unrevoked, 0);
-  });
-});
-
-// ---- the statements run OUTSIDE the block's single transaction ----------------------------------------------------------
-// Since the runbook hardening, statements 5-7 carry current_setting('recovery.new_password') <> '' and so do nothing
-// unless statement 2 set the password in the same transaction.
-type Full = { hash: string; version: number; failed: number; locked: string | null; sessions: string; audits: number };
-async function fullSnapshot(setup: Conn): Promise<Full> {
-  const o = (await setup.unsafe(
-    `select s.secret_hash as hash, u.credential_version as version, u.failed_attempts as failed, u.locked_until::text as locked,
-            (select coalesce(string_agg(a.session_id::text || ':' || coalesce(a.revoked_at::text, '-'), ',' order by a.session_id), '')
-               from app_sessions a where a.user_id = u.id) as sessions,
-            (select count(*)::int from activity_log where action = 'OWNER_PASSWORD_RECOVERY') as audits
-       from app_users u join app_user_secrets s on s.user_id = u.id where u.role = 'owner'`))[0] as unknown as Full;
-  return o;
-}
-const LABELS = ["begin", "lock", "set_config", "guard", "secret", "version bump", "revoke sessions", "audit row", "commit"];
-/** Runs one statement and describes what happened: "ok rows=N" or "ERROR <message>". */
-async function runOne(c: Conn, sql: string): Promise<{ text: string; error: boolean; rows: number }> {
-  try {
-    const res = await c.unsafe(sql);
-    return { text: `ok rows=${res.count ?? res.length}`, error: false, rows: Number(res.count ?? res.length) };
-  } catch (e) {
-    return { text: `ERROR ${(e as Error).message}`, error: true, rows: 0 };
-  }
-}
-
-Deno.test("statements run separately on fresh connections change nothing (every statement after the first either fails or affects no rows)", async () => {
-  await withOwner(async ({ setup, l, owner }) => {
-    const stmts = await block();
-    const before = await fullSnapshot(setup);
-    const outcomes: string[] = [];
-    for (const [i, sql] of stmts.entries()) {
-      const c = connect(); // a fresh connection per statement: no shared transaction, no shared settings
-      try {
-        const o = await runOne(c, sql);
-        outcomes.push(`${i} ${LABELS[i]}: ${o.text}`);
-        if (i >= 3 && i <= 7) assert(o.error || o.rows === 0, `statement ${i} must fail or affect no rows, got ${o.text}`);
-      } finally {
-        await c.end({ timeout: 5 }).catch(() => {});
-      }
-    }
-    console.log("SEPARATE FRESH CONNECTIONS, per statement:\n  " + outcomes.join("\n  "));
-    assertEquals(await fullSnapshot(setup), before, "hash, version, lock fields, every session and the audit log are exactly as before");
-    assertEquals((await verifyAs(l, SEEDED)).ok, true, "the old password still verifies");
-    assertEquals(before.version, owner.credential_version);
-  });
-});
-
-Deno.test("statements run one by one on ONE connection in autocommit mode (no begin/commit) change nothing", async () => {
-  await withOwner(async ({ setup, r, l }) => {
-    const stmts = await block();
-    const before = await fullSnapshot(setup);
-    const outcomes: string[] = [];
-    for (let i = 1; i <= 7; i++) { // begin and commit left out: every statement commits by itself
-      const o = await runOne(r, stmts[i]);
-      outcomes.push(`${i} ${LABELS[i]}: ${o.text}`);
-      if (i >= 4 && i <= 7) assert(o.error || o.rows === 0, `statement ${i} must fail or affect no rows, got ${o.text}`);
-    }
-    console.log("SEPARATE, ONE CONNECTION, AUTOCOMMIT, per statement:\n  " + outcomes.join("\n  "));
-    assertEquals(await fullSnapshot(setup), before, "everything is exactly as before");
-    assertEquals((await verifyAs(l, SEEDED)).ok, true, "the old password still verifies");
-  });
-});
-
-Deno.test("statements sent one by one on one connection WITH begin and commit as separate requests are a real transaction and succeed", async () => {
-  await withOwner(async ({ setup, r, l, owner }) => {
-    const stmts = await block();
-    const before = await fullSnapshot(setup);
-    for (const sql of stmts) await r.unsafe(sql); // begin; ...; commit; each its own request, same session
-    const after = await fullSnapshot(setup);
-    const row = (await setup.unsafe(CHECK_QUERY))[0] as unknown as { credential_version: number; live_sessions: string | number };
-    assertEquals(row.credential_version, owner.credential_version + 1, "version +1");
-    assertEquals(Number(row.live_sessions), 0, "every owner session revoked");
-    assertEquals(after.audits, before.audits + 1, "exactly one OWNER_PASSWORD_RECOVERY row");
-    assertEquals((await verifyAs(l, NEW_PW)).ok, true, "the new password works");
-    assertEquals((await verifyAs(l, SEEDED)).ok, false, "the old one does not");
-  });
-});
-
 // ---- the loader ---------------------------------------------------------------------------------------------------------
-Deno.test("runbook block loader: splits respecting dollar quotes and fails loudly on a wrong shape", () => {
-  const good = "## 1. x\n\n## 2. Password lost\n\n```sql\nbegin;\n-- c\nselect id from app_users where role = 'owner' for update;\nselect set_config('recovery.new_password', $pw$PUT-NEW-PASSWORD-HERE$pw$, true);\ndo $guard$\nbegin\n  if 1 = 2 then raise exception 'STOP: x'; end if;\nend\n$guard$;\nupdate a set b = 1;\nupdate c set d = 2 where current_setting('recovery.new_password') <> '';\nupdate e set f = 3 where current_setting('recovery.new_password') <> '';\nselect 1 where current_setting('recovery.new_password') <> '';\ncommit;\n```\n\n## 3. next\n";
-  const s = loadRecoveryBlock(good, "a;b'c$d");
-  assertEquals(s.length, 9);
-  assertStringIncludes(s[2], "$pw$a;b'c$d$pw$");
-  assertStringIncludes(s[3], "raise exception 'STOP: x'; end if;"); // the semicolons of the do block stay inside one statement
+const GOOD = "## 1. x\n\n## 2. Password lost\n\n```sql\nbegin;\n\ndo $recovery$\ndeclare\n  v_new text := $pw$PUT-NEW-PASSWORD-HERE$pw$;\nbegin\n  select id into v_owner from app_users where role = 'owner' for update;\n  if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then raise exception 'STOP: x'; end if;\n  insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));\n  update app_users set credential_version = credential_version + 1 where id = v_owner;\n  update app_sessions set revoked_at = now() where user_id = v_owner;\n  perform app.log_action(v_owner, 'OWNER_PASSWORD_RECOVERY');\nend\n$recovery$;\n\ncommit;\n```\n\n## 3. next\n";
+Deno.test("runbook block loader: accepts the expected shape, puts the password only in the $pw$ literal, fails loudly otherwise", () => {
+  const s = loadRecoveryBlock(GOOD, "a;b'c$d");
+  assertEquals(s.length, 3);
+  assertStringIncludes(rawRecoveryBlock(GOOD, "a;b'c$d"), "$pw$a;b'c$d$pw$");
   const must = (md: string, text: string) => {
     let msg = "";
     try { loadRecoveryBlock(md, "pw"); } catch (e) { msg = (e as Error).message; }
     assertStringIncludes(msg, text);
   };
   must("nothing", "heading");
-  must(good.replace("```sql", "```text"), "no fenced sql block");
-  must(good.replace("begin;\n-- c", "-- c"), "begin");
-  must(good.replace("commit;\n", ""), "commit");
-  must(good.replace("select id from app_users where role = 'owner' for update;", "select 1;"), "for update");
-  must(good.replace("PUT-NEW-PASSWORD-HERE", "something"), "exactly once");
-  must(good.replace("$pw$PUT-NEW-PASSWORD-HERE$pw$", "'PUT-NEW-PASSWORD-HERE'"), "$pw$");
-  must(good.replace("select set_config('recovery.new_password'", "select set_config('x'"), "set_config");
-  must(good.replace("do $guard$", "do $g$").replace("$guard$;", "$g$;"), "guard");
-  must(good.replace("commit;", "select 2;\ncommit;"), "expected begin");
-  must(good.replace("update c set d = 2 where current_setting('recovery.new_password') <> '';", "update c set d = 2;"), "statement 5");
-  must(good.replace("update e set f = 3 where current_setting('recovery.new_password') <> '';", "update e set f = 3;"), "statement 6");
-  must(good.replace("select 1 where current_setting('recovery.new_password') <> '';", "select 1;"), "statement 7");
+  must(GOOD.replace("```sql", "```text"), "no fenced sql block");
+  must(GOOD.replace("PUT-NEW-PASSWORD-HERE", "something"), "exactly once");
+  must(GOOD.replace("$pw$PUT-NEW-PASSWORD-HERE$pw$", "'PUT-NEW-PASSWORD-HERE'"), "$pw$");
+  must(GOOD.replace("begin;\n\ndo", "do"), "exactly 3 statements");
+  must(GOOD.replace("commit;\n", ""), "exactly 3 statements");
+  must(GOOD.replace("begin;\n\ndo", "select 1;\ndo"), "begin");
+  must(GOOD.replace("\ncommit;", "\nselect 1;"), "commit");
+  must(GOOD.replaceAll("$recovery$", "$r$"), "do $recovery$");
+  must(GOOD.replace("'PUT-NEW-' || 'PASSWORD-HERE'", "'x'"), "'PUT-NEW-' || 'PASSWORD-HERE'");
+  must(GOOD.replace("app.clean_secret('owner', v_new)", "v_new"), "app.clean_secret('owner'");
+  must(GOOD.replace("credential_version = credential_version + 1", "credential_version = 1"), "credential_version");
+  must(GOOD.replace("revoked_at = now()", "x = now()"), "revoked_at");
+  must(GOOD.replace("app.log_action", "app.nothing"), "app.log_action");
+  must(GOOD.replace(" for update;", ";"), "for update");
+  // for update after the first insert
+  must(GOOD.replace(" for update;", ";").replace("insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));", "insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));\n  perform 1 from app_users where role = 'owner' for update;"), "must come before the first insert into");
 });
 Deno.test("splitSql: quotes, doubled quotes, comments and dollar bodies", () => {
   assertEquals(splitSql("select 'a;b'; select 'it''s;'; -- x;\nselect $q$;$q$;"), ["select 'a;b'", "select 'it''s;'", "select $q$;$q$"]);
+  assertEquals(splitSql("do $r$ begin v := $pw$a;b$pw$; end $r$;"), ["do $r$ begin v := $pw$a;b$pw$; end $r$"]);
   let threw = false;
   try { splitSql("select 1"); } catch { threw = true; }
   assert(threw, "a trailing statement without a semicolon is an error");
