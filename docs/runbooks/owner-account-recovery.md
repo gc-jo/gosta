@@ -25,13 +25,13 @@ This does not change the password and does not end any session.
 
 ## 2. Password lost
 
-Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain the character sequences `$pw` or `$recovery` (they would end the quoting early; the block then stops with a syntax error and changes nothing). Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
+Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain a dollar sign (`$`) anywhere. A dollar sign can end the quoting early: usually the block then stops with a syntax error and changes nothing, but a password that ends in `$pw` is silently cut short, so the password stored is not the one you typed and the sign-in at the end fails. If that happens, run the block again with a password that has no dollar sign. Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
 
 Type the new password **once**, between the two `$pw$` markers, replacing `PUT-NEW-PASSWORD-HERE`. Nothing between the markers needs escaping: quotes and backslashes are taken literally. Change nothing else.
 
 First run the check query shown after the block and note the owner's `credential_version`.
 
-Then run the block. All the work is done by **one statement** (the `do` block), so it either happens completely or not at all, however the editor sends it: as one request, statement by statement, or continuing after an error. Inside it, the first thing that happens is a lock on the owner's row. A login with the old password cannot get past it: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended when the sessions are revoked.
+Then run the block. All the work is done by **one statement** (the `do` block), so it either happens completely or not at all, however the editor sends it: as one request, statement by statement, or continuing after an error. Inside it, a lock on the owner's row is taken before anything is changed. A login with the old password cannot get past it: whichever of the two reaches the row first makes the other wait, and either way the old password's login ends up refused or, if it had already finished, ended when the sessions are revoked.
 
 ```sql
 begin;
@@ -49,7 +49,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -79,21 +79,23 @@ $recovery$;
 commit;
 ```
 
-**Do not trust what the editor displays.** It may show `COMMIT`, a notice, an error, or nothing. Whatever it showed, run this check query again:
+**Do not trust what the editor displays.** It may show `COMMIT`, a notice, an error, or nothing. Whatever it showed, open a **new query tab** (so the check does not run inside a transaction the block may have left open) and run this check query again:
 
 ```sql
 select employee_number,
        credential_version,
        locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions,
+       pg_current_xact_id_if_assigned() is null as nothing_pending
 from app_users u
 where role = 'owner';
 ```
 
+- `nothing_pending` must be `true`. If it is `false`, this tab still has an unfinished transaction and what you see is not yet saved: run `commit;` if the block reported no error, or `rollback;` if it did, then run the check query again.
 - `credential_version` is exactly one higher than the value you noted, and `live_sessions` is 0: the password was changed. (Two higher means the block ran twice; that is harmless, and the password is the one from the last run.)
 - `credential_version` is unchanged: nothing was changed, whatever the editor displayed. If an error was shown (`STOP: …`, `SECRET_WEAK`, `SECRET_TOO_LONG`, `SECRET_INVALID`, or a syntax error), correct the cause and run the block again. If the editor left a transaction open, run `rollback;` first.
 
-The final proof is the next step: sign in to the app with the new password, and confirm the old one is refused. Then **change the password again from Settings straight away**: the password you typed is kept in the dashboard's query history and may be written to the database's statement and error logs, whether the block succeeded or not.
+The final proof is the next step: sign in to the app with the new password, and confirm the old one is refused. Then **change the password again from Settings straight away**: the password you typed is kept in the dashboard's query history and in the database's record of executed statements, and if the block reported any error the whole block, password included, was also written to the database's error log. Treat it as known to anyone who can read those.
 
 What this does not touch: the owner's sign-ins at Supabase Auth itself are not ended. They are useless on their own, because every read and every action in the app checks the app's own session list, which the block has just emptied. This holds as long as nothing is added to the project that trusts a Supabase Auth session without that check.
 
