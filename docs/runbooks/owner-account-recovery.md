@@ -25,7 +25,7 @@ This does not change the password and does not end any session.
 
 ## 2. Password lost
 
-Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain a dollar sign (`$`) anywhere. A dollar sign can end the quoting early: usually the block then stops with a syntax error and changes nothing, but a password that ends in `$pw` is silently cut short, so the password stored is not the one you typed and the sign-in at the end fails. If that happens, run the block again with a password that has no dollar sign. Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
+Choose a new password of at least 12 characters and at most 72 bytes (an Arabic letter counts as 2 bytes). It is compared exactly as typed: Arabic and Latin digits are different characters. It must not contain control characters (tab, line break and the like), and it must not contain a dollar sign (`$`) anywhere. A dollar sign can end the quoting early: usually the block then stops with a syntax error and changes nothing, but in some positions (for example a password ending in `$pw`, or containing `$pw$` followed by one more word) the password is silently cut short at the dollar sign, so the password stored is not the one you typed and the sign-in at the end fails. If that happens, run the block again with a password that has no dollar sign. Type it on the keyboard rather than pasting from a formatted document, and do not press Tab inside it: an editor may turn a tab into spaces, which would be a different password.
 
 Type the new password **once**, between the two `$pw$` markers, replacing `PUT-NEW-PASSWORD-HERE`. Nothing between the markers needs escaping: quotes and backslashes are taken literally. Change nothing else.
 
@@ -79,7 +79,10 @@ $recovery$;
 commit;
 ```
 
-**Do not trust what the editor displays.** It may show `COMMIT`, a notice, an error, or nothing. Whatever it showed, open a **new query tab** (so the check does not run inside a transaction the block may have left open) and run this check query again:
+**Do not trust what the editor displays.** It may show `COMMIT`, a notice, an error, or nothing. Whatever it showed, do these two things **in the same tab** in which you ran the block:
+
+1. Run `rollback;` on its own. This cannot undo a change that was saved; it only clears a transaction the block may have left unfinished or failed, which would otherwise keep the owner's row locked and make the next step misleading. A message such as "there is no transaction in progress" is the normal answer and means there was nothing to clear.
+2. Run this check query again:
 
 ```sql
 select employee_number,
@@ -91,9 +94,9 @@ from app_users u
 where role = 'owner';
 ```
 
-- `nothing_pending` must be `true`. If it is `false`, this tab still has an unfinished transaction and what you see is not yet saved: run `commit;` if the block reported no error, or `rollback;` if it did, then run the check query again.
+- `nothing_pending` must be `true`. After the `rollback;` in step 1 it always should be. If it is `false`, the tab still has an unfinished transaction and what you see is not saved: run `rollback;` again, then the check query again.
 - `credential_version` is exactly one higher than the value you noted, and `live_sessions` is 0: the password was changed. (Two higher means the block ran twice; that is harmless, and the password is the one from the last run.)
-- `credential_version` is unchanged: nothing was changed, whatever the editor displayed. If an error was shown (`STOP: …`, `SECRET_WEAK`, `SECRET_TOO_LONG`, `SECRET_INVALID`, or a syntax error), correct the cause and run the block again. If the editor left a transaction open, run `rollback;` first.
+- `credential_version` is unchanged: nothing was changed, whatever the editor displayed. If an error was shown (`STOP: …`, `SECRET_WEAK`, `SECRET_TOO_LONG`, `SECRET_INVALID`, or a syntax error), correct the cause and run the block again, in the same tab. If the check query itself fails with "current transaction is aborted", step 1 was skipped: run `rollback;` and then the check query.
 
 The final proof is the next step: sign in to the app with the new password, and confirm the old one is refused. Then **change the password again from Settings straight away**: the password you typed is kept in the dashboard's query history and in the database's record of executed statements, and if the block reported any error the whole block, password included, was also written to the database's error log. Treat it as known to anyone who can read those.
 
