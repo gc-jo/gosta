@@ -4,7 +4,7 @@
 -- Everything runs as postgres, like the dashboard's SQL editor (which bypasses the app's access rules);
 -- the seeded owner is '100' with password 'correct horse battery'.
 begin;
-select plan(49);
+select plan(51);
 
 create schema t12c;
 create function t12c.owner_id() returns uuid language sql stable as $$ select id from app_users where role = 'owner' $$;
@@ -54,7 +54,7 @@ select is(t12c.lv('100', 'correct horse battery'), 'ok', 'the owner logs in with
 select is(t12c.live(), 1::bigint, 'runbook 1 ended no session');
 
 -- 2. Password lost --------------------------------------------------------------------------------------
--- The runbook's block is: begin; <ONE do $recovery$ statement>; commit;. The do statement below is copied from it;
+-- The runbook's block is: begin; <ONE do statement>; commit;. The do statement below is copied from it;
 -- only the placeholder PUT-NEW-PASSWORD-HERE (inside the $pw$ literal) is replaced. The explicit begin/commit are left out
 -- because they cannot be nested inside this file's own transaction. The two-connection test
 -- supabase/tests-concurrency/owner_recovery_test.ts reads the block from the runbook itself and proves the begin..commit
@@ -94,7 +94,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -139,7 +139,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -185,7 +185,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -230,7 +230,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -272,7 +272,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -314,7 +314,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -358,7 +358,7 @@ begin
   end if;
 
   -- lock the owner's row first; everything below happens under this lock
-  select id into v_owner from app_users where role = 'owner' for update;
+  select id into strict v_owner from app_users where role = 'owner' for update;
 
   -- the placeholder must have been replaced
   if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then
@@ -389,29 +389,44 @@ select lives_ok($q$
 select employee_number,
        credential_version,
        locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions,
+       pg_current_xact_id_if_assigned() is null as nothing_pending
 from app_users u
 where role = 'owner';
 $q$, 'runbook 2: the verification query runs');
 select is((select count(*) from (select employee_number,
        credential_version,
        locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions,
+       pg_current_xact_id_if_assigned() is null as nothing_pending
 from app_users u
 where role = 'owner') q), 1::bigint, 'the verification query returns exactly one row');
 select is((select live_sessions from (select employee_number,
        credential_version,
        locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions,
+       pg_current_xact_id_if_assigned() is null as nothing_pending
 from app_users u
 where role = 'owner') q), 0::bigint, 'with live_sessions = 0');
 select is((select credential_version from (select employee_number,
        credential_version,
        locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions,
+       pg_current_xact_id_if_assigned() is null as nothing_pending
 from app_users u
 where role = 'owner') q), (select cv + 1 from t12c.before), 'and credential_version one higher');
 select is((select locked_until is null and failed_attempts = 0 from app_users where role = 'owner'), true, 'the lock and the counter are cleared');
+-- nothing_pending: inside this test's transaction a transaction id HAS been assigned (the statement wrote rows), so the
+-- column is false here. That is the expected value in this file; the meaningful assertion (false on the session that has
+-- not committed, true on another session and after commit) is made on separate connections in owner_recovery_test.ts.
+select is((select nothing_pending from (select employee_number,
+       credential_version,
+       locked_until,
+       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions,
+       pg_current_xact_id_if_assigned() is null as nothing_pending
+from app_users u
+where role = 'owner') q), false, 'nothing_pending is false inside the writing transaction');
+select is((select user_id = t12c.owner_id() and entity_id = t12c.owner_id()::text from activity_log where action = 'OWNER_PASSWORD_RECOVERY' order by at desc limit 1), true, 'the newest OWNER_PASSWORD_RECOVERY row carries the owner as user_id and entity_id');
 select is((select count(*) from activity_log where action = 'OWNER_PASSWORD_RECOVERY'), (select audits + 1 from t12c.snap), 'exactly one OWNER_PASSWORD_RECOVERY row was added');
 select isnt((select secret_hash from app_user_secrets where user_id = t12c.owner_id()), (select hash from t12c.snap), 'the stored hash changed');
 select is(t12c.live(), 0::bigint, 'every prior owner session is revoked');

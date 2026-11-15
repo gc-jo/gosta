@@ -93,9 +93,10 @@ export function loadRecoveryBlock(md: string, password: string): string[] {
   if (stmts.length !== 3) throw new Error(`runbook block: expected exactly 3 statements (begin, one do block, commit), got ${stmts.length}`);
   if (stmts[0].toLowerCase() !== "begin") throw new Error("runbook block must start with begin;");
   if (stmts[2].toLowerCase() !== "commit") throw new Error("runbook block must end with commit;");
-  const d = stmts[1];
-  if (!/^do \$recovery\$/.test(d) || !d.endsWith("$recovery$")) throw new Error("runbook block: the middle statement must be one do $recovery$ ... $recovery$ block");
-  for (const need of ["'PUT-NEW-' || 'PASSWORD-HERE'", "app.clean_secret('owner'", "credential_version = credential_version + 1", "revoked_at", "app.log_action"]) {
+  if (!/^do \$recovery\$/.test(stmts[1]) || !stmts[1].endsWith("$recovery$")) throw new Error("runbook block: the middle statement must be one do $recovery$ ... $recovery$ block");
+  // searched without SQL comments (and without the password literal), so that a comment cannot satisfy a check
+  const d = stmts[1].replace(/\$pw\$[\s\S]*?\$pw\$/g, "''").replace(/--[^\n]*/g, "");
+  for (const need of ["v_count <> 1", "STOP: expected exactly one owner row", "into strict v_owner", "'PUT-NEW-' || 'PASSWORD-HERE'", "app.clean_secret('owner'", "credential_version = credential_version + 1", "revoked_at", "app.log_action"]) {
     if (!d.includes(need)) throw new Error(`runbook block: the do body must contain ${need}`);
   }
   const lock = d.indexOf("for update");
@@ -228,9 +229,16 @@ async function fullSnapshot(setup: Conn): Promise<Full> {
 }
 const passwordMatches = async (setup: Conn, pw: string) =>
   ((await setup.unsafe(`select (extensions.crypt($1, s.secret_hash) = s.secret_hash) as ok from app_user_secrets s join app_users u on u.id = s.user_id where u.role = 'owner'`, [pw]))[0] as unknown as { ok: boolean }).ok;
-const CHECK_QUERY = `select employee_number, credential_version, locked_until,
-       (select count(*) from app_sessions s where s.user_id = u.id and s.revoked_at is null) as live_sessions
-from app_users u where role = 'owner'`;
+/** The runbook's check query: the second fenced sql block of section 2, read from the file (no copy here). */
+export function checkQueryOf(md: string): string {
+  const h = md.indexOf("\n## 2. Password lost");
+  const rest = md.slice(h + 1);
+  const next = rest.indexOf("\n## ", 5);
+  const blocks = [...(next < 0 ? rest : rest.slice(0, next)).matchAll(/```sql\n([\s\S]*?)\n```/g)].map((m) => m[1]);
+  if (blocks.length < 2 || !blocks[1].includes("nothing_pending")) throw new Error("runbook: the check query (second sql block of section 2, with nothing_pending) not found");
+  return blocks[1];
+}
+const CHECK_QUERY = checkQueryOf(await Deno.readTextFile(RUNBOOK));
 
 /** The normal success, compared with a snapshot taken before; lock fields cleared. `times` = how many recoveries ran. */
 async function assertRecovered(ctx: Ctx, before: Full, pw: string, times = 1) {
@@ -238,8 +246,9 @@ async function assertRecovered(ctx: Ctx, before: Full, pw: string, times = 1) {
   const after = await fullSnapshot(setup);
   const rows = await setup.unsafe(CHECK_QUERY);
   assertEquals(rows.length, 1, "the check query returns exactly one row");
-  const row = rows[0] as unknown as { credential_version: number; live_sessions: string | number; locked_until: unknown };
+  const row = rows[0] as unknown as { credential_version: number; live_sessions: string | number; locked_until: unknown; nothing_pending: boolean };
   assertEquals(Number(row.live_sessions), 0, "live_sessions = 0");
+  assertEquals(row.nothing_pending, true, "nothing_pending: the checking session has no unfinished transaction");
   assertEquals(row.credential_version, owner.credential_version + times, "credential_version up by the number of runs");
   assertEquals([after.failed, after.locked], [0, null], "failed_attempts and locked_until are cleared");
   assertEquals(after.audits, before.audits + times, "one OWNER_PASSWORD_RECOVERY row per run");
@@ -373,7 +382,7 @@ Deno.test("2d. login_verify with the NEW password during the recovery waits for 
   });
 });
 
-Deno.test("2e. the lock comes before any change: while the recovery waits for L's row lock it holds no RowExclusiveLock on app_user_secrets, app_sessions or app_users", async () => {
+Deno.test("2e. the lock comes before any change: while the recovery waits for L's row lock it holds no RowExclusiveLock on app_user_secrets, app_sessions, app_users or activity_log", async () => {
   await withOwner(async (ctx) => {
     const { setup, r, l, admin } = ctx;
     const before = await fullSnapshot(setup);
@@ -387,8 +396,8 @@ Deno.test("2e. the lock comes before any change: while the recovery waits for L'
          from pg_locks l left join pg_class c on c.oid = l.relation where l.pid = ${Number(pidR)}`) as unknown as
       Array<{ locktype: string; mode: string; granted: boolean; relname: string | null }>;
     console.log("R's locks while waiting:", JSON.stringify(locks.map((x) => [x.locktype, x.mode, x.granted, x.relname])));
-    const writes = locks.filter((x) => x.mode === "RowExclusiveLock" && ["app_user_secrets", "app_sessions", "app_users"].includes(x.relname ?? ""));
-    assertEquals(writes, [], "R has not started any insert or update: no RowExclusiveLock on the three tables");
+    const writes = locks.filter((x) => x.mode === "RowExclusiveLock" && ["app_user_secrets", "app_sessions", "app_users", "activity_log"].includes(x.relname ?? ""));
+    assertEquals(writes, [], "R has not started any insert or update: no RowExclusiveLock on the four tables");
     assert(locks.some((x) => !x.granted && (x.locktype === "tuple" || x.locktype === "transactionid")), "R is waiting for a tuple/transaction lock (the owner row held by L)");
     assertEquals((await fullSnapshot(setup)).hash, before.hash, "nothing has been stored yet");
     await l.unsafe("rollback");
@@ -559,6 +568,112 @@ for (const marker of ["$pw$", "$recovery$"]) {
   });
 }
 
+// ---- tied to the runbook text -----------------------------------------------------------------------------------------
+const norm = (x: string) => x.replace(/\s+/g, " ").trim();
+Deno.test("the copies in 10c_owner_recovery.test.sql are identical to the runbook's do statement and check query", async () => {
+  const md = await blockOf();
+  const runbookDo = norm(loadRecoveryBlock(md, PLACEHOLDER)[1]);
+  const sql = await Deno.readTextFile(new URL("../tests/10c_owner_recovery.test.sql", import.meta.url));
+  const copies = [...sql.matchAll(/do \$recovery\$[\s\S]*?\$recovery\$/g)].map((m) => m[0]);
+  assert(copies.length >= 7, `expected at least 7 copies of the do statement in 10c, found ${copies.length}`);
+  for (const [i, c] of copies.entries()) {
+    assertEquals(norm(c.replace(/\$pw\$[\s\S]*?\$pw\$/, `$pw$${PLACEHOLDER}$pw$`)), runbookDo, `copy ${i + 1} of the do statement differs from the runbook`);
+  }
+  const check = norm(CHECK_QUERY.replace(/;\s*$/, ""));
+  const queries = [...sql.matchAll(/select employee_number,\s+credential_version,[\s\S]*?where role = 'owner'/g)].map((m) => norm(m[0]));
+  assert(queries.length >= 2, `expected at least 2 copies of the check query in 10c, found ${queries.length}`);
+  for (const [i, q] of queries.entries()) assertEquals(q, check, `copy ${i + 1} of the check query differs from the runbook`);
+});
+
+// ---- the check query ----------------------------------------------------------------------------------------------------
+Deno.test("check query: with commit not yet sent, the same session sees the bump and nothing_pending false, another session sees the old state and true; after commit all agree", async () => {
+  await withOwner(async ({ r, other, owner }) => {
+    const { begin, doText, commit } = await parts();
+    await r.unsafe(begin);
+    await r.unsafe(doText); // everything done, NOT committed
+    type Row = { credential_version: number; live_sessions: string | number; nothing_pending: boolean };
+    const same = (await r.unsafe(CHECK_QUERY))[0] as unknown as Row;
+    assertEquals(same.nothing_pending, false, "same session, commit not sent: something is pending");
+    assertEquals([same.credential_version, Number(same.live_sessions)], [owner.credential_version + 1, 0], "...and the version already looks bumped: the misreading the column exists to expose");
+    const elsewhere = (await other.unsafe(CHECK_QUERY))[0] as unknown as Row;
+    assertEquals(elsewhere.nothing_pending, true, "a different session has nothing pending");
+    assertEquals(elsewhere.credential_version, owner.credential_version, "and sees the version NOT yet bumped");
+    assertEquals(Number(elsewhere.live_sessions), owner.live.length, "and the sessions still live");
+    await r.unsafe(commit);
+    const fresh = connect();
+    try {
+      const after = (await fresh.unsafe(CHECK_QUERY))[0] as unknown as Row;
+      assertEquals([after.nothing_pending, after.credential_version, Number(after.live_sessions)], [true, owner.credential_version + 1, 0], "after commit, on a fresh connection");
+    } finally {
+      await fresh.end({ timeout: 5 }).catch(() => {});
+    }
+  });
+});
+
+// ---- two owners on the real path ------------------------------------------------------------------------------------------
+Deno.test("two owner rows (committed): the block stops with STOP ... found 2 and changes nothing for either row", async () => {
+  await withOwner(async (ctx) => {
+    const { setup, r } = ctx;
+    await setup.unsafe(`insert into app_users (employee_number, name, role) values ('90007777', 'second owner', 'owner')`);
+    try {
+      const before = await fullSnapshot(setup);
+      const second = async () => JSON.stringify(await setup.unsafe(`select credential_version, failed_attempts, locked_until, active from app_users where employee_number = '90007777'`));
+      const secondBefore = await second();
+      const err = await errMsg(sendWhole(r, await blockText()));
+      assert(err !== null, "the block must fail");
+      assertStringIncludes(err.message, "STOP: expected exactly one owner row, found 2");
+      await rollbackQuietly(r);
+      assertEquals(await second(), secondBefore, "the second owner row is untouched");
+      await assertUnchanged(ctx, before, "two owners");
+    } finally {
+      await setup.unsafe(`delete from app_users where employee_number = '90007777'`);
+    }
+  }, { prime: true });
+});
+
+// ---- a dollar sign in the password: the real behaviour -----------------------------------------------------------------------
+// The runbook forbids a dollar sign anywhere. What actually happens if one is typed (single request, as the runbook prescribes):
+//  - "...$pw" at the end, and "<12+ chars>$pw$ word": the block SUCCEEDS and the password stored is the PREFIX before the
+//    first `$pw` (the rest becomes a harmless column alias after the closed literal); the typed string does not work.
+//  - "<chars>$pw$" with nothing usable after it, and "...$pw$second pass 12345" with spaces after it: syntax error, nothing changed.
+//  - a lone `$` in the middle or at the end: harmless, the full string is stored.
+type DollarCase = { name: string; pw: string; outcome: "prefix" | "full" | "error"; prefix?: string };
+const DOLLAR_CASES: DollarCase[] = [
+  { name: "ending in $pw", pw: "typed password 1234$pw", outcome: "prefix", prefix: "typed password 1234" },
+  { name: "12+ chars then $pw$ and one word", pw: "abcdefghijkl$pw$ word", outcome: "prefix", prefix: "abcdefghijkl" },
+  { name: "12+ chars then $pw$ and several words", pw: "abcdefghijkl$pw$second pass 12345", outcome: "error" },
+  { name: "12+ chars then $pw$ and nothing", pw: "abcdefghijkl$pw$", outcome: "error" },
+  { name: "a lone $ in the middle", pw: "abcdef$ghijkl pass 12", outcome: "full" },
+  { name: "a lone $ at the end", pw: "abcdefghijkl pass 12$", outcome: "full" },
+];
+for (const c of DOLLAR_CASES) {
+  Deno.test(`dollar sign: password ${c.name} -> ${c.outcome === "prefix" ? "SUCCEEDS with the prefix stored" : c.outcome === "full" ? "succeeds with the full string stored" : "syntax error, nothing changed"}`, async () => {
+    await withOwner(async (ctx) => {
+      const { setup, r, l } = ctx;
+      const before = await fullSnapshot(setup);
+      const err = await errMsg(sendWhole(r, await blockText(c.pw)));
+      console.log(`DOLLAR ${JSON.stringify(c.pw)}: ${err === null ? "SUCCESS" : "ERROR " + err.message.slice(0, 70).replace(/\s+/g, " ")}`);
+      if (c.outcome === "error") {
+        assert(err !== null, "the block fails");
+        await rollbackQuietly(r);
+        await assertUnchanged(ctx, before, c.name, c.pw);
+        return;
+      }
+      assertEquals(err, null, "the block succeeds");
+      const after = await fullSnapshot(setup);
+      assertEquals(after.version, before.version + 1);
+      assertEquals(after.audits, before.audits + 1);
+      if (c.outcome === "prefix") {
+        assertEquals((await verifyAs(l, c.pw)).ok, false, "the typed string does NOT log in");
+        assertEquals((await verifyAs(l, c.prefix!)).ok, true, "the prefix before the first $pw is the stored password");
+      } else {
+        assertEquals((await verifyAs(l, c.pw)).ok, true, "the full typed string logs in");
+        assertEquals((await verifyAs(l, c.pw.split("$")[0])).ok, false, "the prefix does not");
+      }
+    });
+  });
+}
+
 // ---- the original defect -----------------------------------------------------------------------------------------------
 // DEMONSTRATION of the defect the lock closes (the first runbook order, merely wrapped in a transaction); it does not
 // guard the current runbook (the tests above do that).
@@ -600,7 +715,7 @@ Deno.test("h. DEMONSTRATION, old order in a transaction, no row lock: a verified
 });
 
 // ---- the loader ---------------------------------------------------------------------------------------------------------
-const GOOD = "## 1. x\n\n## 2. Password lost\n\n```sql\nbegin;\n\ndo $recovery$\ndeclare\n  v_new text := $pw$PUT-NEW-PASSWORD-HERE$pw$;\nbegin\n  select id into v_owner from app_users where role = 'owner' for update;\n  if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then raise exception 'STOP: x'; end if;\n  insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));\n  update app_users set credential_version = credential_version + 1 where id = v_owner;\n  update app_sessions set revoked_at = now() where user_id = v_owner;\n  perform app.log_action(v_owner, 'OWNER_PASSWORD_RECOVERY');\nend\n$recovery$;\n\ncommit;\n```\n\n## 3. next\n";
+const GOOD = "## 1. x\n\n## 2. Password lost\n\n```sql\nbegin;\n\ndo $recovery$\ndeclare\n  v_new text := $pw$PUT-NEW-PASSWORD-HERE$pw$;\nbegin\n  select count(*) into v_count from app_users where role = 'owner';\n  if v_count <> 1 then raise exception 'STOP: expected exactly one owner row, found %', v_count; end if;\n  select id into strict v_owner from app_users where role = 'owner' for update;\n  if v_new = 'PUT-NEW-' || 'PASSWORD-HERE' then raise exception 'STOP: x'; end if;\n  insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));\n  update app_users set credential_version = credential_version + 1 where id = v_owner;\n  update app_sessions set revoked_at = now() where user_id = v_owner;\n  perform app.log_action(v_owner, 'OWNER_PASSWORD_RECOVERY');\nend\n$recovery$;\n\ncommit;\n```\n\n## 3. next\n";
 Deno.test("runbook block loader: accepts the expected shape, puts the password only in the $pw$ literal, fails loudly otherwise", () => {
   const s = loadRecoveryBlock(GOOD, "a;b'c$d");
   assertEquals(s.length, 3);
@@ -625,6 +740,15 @@ Deno.test("runbook block loader: accepts the expected shape, puts the password o
   must(GOOD.replace("revoked_at = now()", "x = now()"), "revoked_at");
   must(GOOD.replace("app.log_action", "app.nothing"), "app.log_action");
   must(GOOD.replace(" for update;", ";"), "for update");
+  must(GOOD.replace("if v_count <> 1 then", "if v_count <> 2 then"), "v_count <> 1");
+  must(GOOD.replace("STOP: expected exactly one owner row", "STOP: x"), "STOP: expected exactly one owner row");
+  must(GOOD.replace("into strict v_owner", "into v_owner"), "into strict v_owner");
+  // a comment must not satisfy a check
+  must(GOOD.replace("into strict v_owner", "into v_owner -- into strict v_owner"), "into strict v_owner");
+  must(GOOD.replace("v_count <> 1", "v_count <> 2\n  -- v_count <> 1"), "v_count <> 1");
+  must(GOOD.replace(" for update;", ";").replace("begin\n", "begin\n  -- select ... for update\n"), "for update");
+  must(GOOD.replace(" for update;", ";").replace("insert into app_user_secrets", "-- for update\n  insert into app_user_secrets"), "for update");
+  must(GOOD.replace("revoked_at = now()", "x = now() -- revoked_at"), "revoked_at");
   // for update after the first insert
   must(GOOD.replace(" for update;", ";").replace("insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));", "insert into app_user_secrets values (v_owner, app.clean_secret('owner', v_new));\n  perform 1 from app_users where role = 'owner' for update;"), "must come before the first insert into");
 });
