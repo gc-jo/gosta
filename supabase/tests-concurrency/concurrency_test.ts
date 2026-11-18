@@ -113,3 +113,75 @@ Deno.test("double receipt: one ok, one LINE_NOT_PENDING, one transfer_in per lin
     assertEquals(st[0].status, "received");
   });
 });
+
+// G2 --------------------------------------------------------------------------------------------------
+
+/** 203's receipt of the single line, short by half: 1 of the 2 bottles sent, reason not_loaded. */
+function receiveHalf(c: Conn, t: { transfer: string; line: string }) {
+  return rpc(c, "receive_transfer", {
+    p_request_id: crypto.randomUUID(),
+    p_transfer_id: t.transfer,
+    p_lines: [{ line_id: t.line, quantity: 1, unit: BOTTLE, diff_reason: "not_loaded" }],
+  });
+}
+
+function deny(c: Conn, line: string) {
+  return rpc(c, "owner_resolve_transfer_line", { p_request_id: crypto.randomUUID(), p_line_id: line, p_action: "deny" });
+}
+
+async function lineState(c: Conn, line: string) {
+  const rows = await q<{ status: string; rbase: string | null }>(
+    c, `select status, received_base_quantity::text as rbase from transfer_lines where id = $1`, [line]);
+  return rows[0];
+}
+
+Deno.test("receipt (short by half) vs owner deny: B gets LINE_NOT_PENDING; source net = -received_base_quantity", async () => {
+  await withConns(async ({ a, b, admin, setup }) => {
+    const t = await sendToBr03(setup, 2, BOTTLE);
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "203");
+        return await receiveHalf(a, t);
+      },
+      async () => {
+        await begin(b, "100");
+        return await deny(b, t.line);
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    assertEquals(okValue(ra, "A's receipt").received, 1);
+    assertError(rb, "LINE_NOT_PENDING", "B's deny");
+    const st = await lineState(setup, t.line);
+    assertEquals(st.status, "received");
+    assertEquals(Number(st.rbase), 750);
+    const source = await movements(setup, t.line, null, "BR-14");
+    assertEquals(source.sum, -Number(st.rbase), "source net for the line = -received_base_quantity");
+    assertEquals((await movements(setup, t.line, "transfer_in", "BR-03")).sum, 750);
+  });
+});
+
+Deno.test("owner deny vs receipt: line denied, B gets LINE_NOT_PENDING; source net = 0", async () => {
+  await withConns(async ({ a, b, admin, setup }) => {
+    const t = await sendToBr03(setup, 2, BOTTLE);
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "100");
+        return await deny(a, t.line);
+      },
+      async () => {
+        await begin(b, "203");
+        return await receiveHalf(b, t);
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    assertEquals(okValue(ra, "A's deny").status, "denied");
+    assertError(rb, "LINE_NOT_PENDING", "B's receipt");
+    assertEquals((await lineState(setup, t.line)).status, "denied");
+    assertEquals((await movements(setup, t.line, null, "BR-14")).sum, 0, "source net for the line = 0");
+    assertEquals((await movements(setup, t.line, "transfer_in", null)).n, 0, "no transfer_in");
+  });
+});
