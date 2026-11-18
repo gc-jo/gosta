@@ -326,3 +326,37 @@ Deno.test("same request id twice: both return the same purchase_id; one purchase
     assertEquals(ins[0].n, 1, "one purchase_in");
   });
 });
+
+// G4 --------------------------------------------------------------------------------------------------
+
+async function ledgerCounts(c: Conn) {
+  const rows = await q<{ t: number; l: number; m: number }>(
+    c,
+    `select (select count(*) from transfers)::int as t, (select count(*) from transfer_lines)::int as l,
+            (select count(*) from stock_movements)::int as m`,
+  );
+  return rows[0];
+}
+
+for (const [label, quantity] of [["1e13 (JSON number)", 1e13], ["1e131070 (numeric string)", "1e131070"]] as const) {
+  Deno.test(`oversized quantity ${label} on a committed connection: QUANTITY_INVALID, nothing written`, async () => {
+    await withConns(async ({ a, setup }) => {
+      const req = crypto.randomUUID();
+      const before = await ledgerCounts(setup);
+      await begin(a, "203");
+      const r = await rpc(a, "send_transfer", {
+        p_request_id: req, p_to_branch: "BR-14", p_lines: [{ item_id: ITEM, unit: ML, quantity }],
+      });
+      await commit(a); // the transaction is aborted: commit ends it as a rollback
+      assertError(r, "QUANTITY_INVALID", "send_transfer with an oversized quantity");
+      assertEquals(await ledgerCounts(setup), before, "no transfer, transfer line or stock movement written");
+      const own = await q<{ t: number; r: number }>(
+        setup,
+        `select (select count(*) from transfers where request_id = $1)::int as t,
+                (select count(*) from rpc_requests where request_id = $1)::int as r`,
+        [req],
+      );
+      assertEquals(own[0], { t: 0, r: 0 }, "no transfer row and no stored request for this request id");
+    });
+  });
+}
