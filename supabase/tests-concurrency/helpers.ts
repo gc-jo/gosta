@@ -37,7 +37,9 @@ export function connect(): Conn {
     target_session_attrs: "read-write",
     onnotice: () => {},
   };
-  return postgres(options as unknown as postgres.Options<Record<string, never>>);
+  return postgres(
+    options as unknown as postgres.Options<Record<string, never>>,
+  );
 }
 
 /** The server process id of a connection. */
@@ -51,30 +53,49 @@ export async function backendPid(c: Conn): Promise<number> {
  * is waiting for a lock. Fails after `timeoutMs` if it never blocks, so a test can
  * assert that a statement really waited instead of guessing with a sleep.
  */
-export async function waitUntilBlocked(admin: Conn, pid: number, timeoutMs = 5000): Promise<void> {
+export async function waitUntilBlocked(
+  admin: Conn,
+  pid: number,
+  timeoutMs = 5000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const rows = await admin.unsafe(
-      `select 1 from pg_stat_activity where pid = ${Number(pid)} and wait_event_type = 'Lock'`,
+      `select 1 from pg_stat_activity where pid = ${
+        Number(pid)
+      } and wait_event_type = 'Lock'`,
     );
     if (rows.length > 0) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error(`backend ${pid} was never blocked on a lock within ${timeoutMs} ms`);
+  throw new Error(
+    `backend ${pid} was never blocked on a lock within ${timeoutMs} ms`,
+  );
 }
 
 /** The backend pids that `pid` is waiting for (pg_blocking_pids), seen through `admin`. */
 export async function blockersOf(admin: Conn, pid: number): Promise<number[]> {
-  const rows = await admin.unsafe(`select unnest(pg_blocking_pids(${Number(pid)})) as b`);
+  const rows = await admin.unsafe(
+    `select unnest(pg_blocking_pids(${Number(pid)})) as b`,
+  );
   return rows.map((r) => Number((r as unknown as { b: number }).b));
 }
 
 /** Like waitUntilBlocked, and then asserts that `expectedBlocker` is among the backends it waits for. */
-export async function waitUntilBlockedBy(admin: Conn, pid: number, expectedBlocker: number, timeoutMs = 5000): Promise<void> {
+export async function waitUntilBlockedBy(
+  admin: Conn,
+  pid: number,
+  expectedBlocker: number,
+  timeoutMs = 5000,
+): Promise<void> {
   await waitUntilBlocked(admin, pid, timeoutMs);
   const blockers = await blockersOf(admin, pid);
   if (!blockers.includes(expectedBlocker)) {
-    throw new Error(`backend ${pid} waits for ${JSON.stringify(blockers)}, not for backend ${expectedBlocker}`);
+    throw new Error(
+      `backend ${pid} waits for ${
+        JSON.stringify(blockers)
+      }, not for backend ${expectedBlocker}`,
+    );
   }
 }
 
@@ -104,14 +125,23 @@ const NAME_RE = /^[a-z_][a-z0-9_]*$/;
  * (objects and arrays for a jsonb parameter are JSON-encoded once by the driver). A json/jsonb result
  * comes back parsed.
  */
-export async function rpc(c: Conn, name: string, args: Record<string, unknown>): Promise<RpcResult> {
+export async function rpc(
+  c: Conn,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<RpcResult> {
   if (!NAME_RE.test(name)) throw new Error(`bad function name ${name}`);
   const keys = Object.keys(args);
-  for (const k of keys) if (!NAME_RE.test(k)) throw new Error(`bad argument name ${k}`);
+  for (const k of keys) {
+    if (!NAME_RE.test(k)) throw new Error(`bad argument name ${k}`);
+  }
   const list = keys.map((k, i) => `${k} => $${i + 1}`).join(", ");
   const values = keys.map((k) => args[k] ?? null);
   try {
-    const rows = await c.unsafe(`select public.${name}(${list}) as r`, values as never[]);
+    const rows = await c.unsafe(
+      `select public.${name}(${list}) as r`,
+      values as never[],
+    );
     let r = (rows[0] as unknown as { r: unknown }).r;
     if (typeof r === "string" && (r.startsWith("{") || r.startsWith("["))) {
       try {
@@ -150,7 +180,8 @@ export async function overlap<T, U>(
   return [ra, rb.v];
 }
 
-const UUID_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Makes the transaction already open on `c` act as an app session, the way a request through the
@@ -158,11 +189,19 @@ const UUID_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
  * id (`sub`) and the app session id (`session_id`). Call it right after `begin`; both settings end
  * with the transaction.
  */
-export async function actAsSession(c: Conn, authUserId: string, sessionId: string): Promise<void> {
+export async function actAsSession(
+  c: Conn,
+  authUserId: string,
+  sessionId: string,
+): Promise<void> {
   if (!UUID_RE.test(authUserId) || !UUID_RE.test(sessionId)) {
     throw new Error("actAsSession needs two uuids");
   }
-  const claims = JSON.stringify({ sub: authUserId, role: "authenticated", session_id: sessionId });
+  const claims = JSON.stringify({
+    sub: authUserId,
+    role: "authenticated",
+    session_id: sessionId,
+  });
   await c.unsafe("set local role authenticated");
   await c.unsafe("select set_config('request.jwt.claims', $1, true)", [claims]);
 }
