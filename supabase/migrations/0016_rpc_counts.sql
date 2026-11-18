@@ -297,3 +297,163 @@ grant execute on function public.close_count_window(uuid, text, date) to authent
 grant execute on function public.start_count(uuid) to authenticated;
 grant execute on function public.save_count_line(uuid, text, int, text, jsonb) to authenticated;
 grant execute on function public.discard_count(uuid, uuid) to authenticated;
+
+-- Task 9: submit fixes each round's stock cutoff; approval uses those stored
+-- cutoffs, never the time of review. Request -> branch -> count -> line locks.
+create function public.submit_count(p_request_id uuid, p_count_id uuid, p_expected_revision int)
+returns jsonb
+language plpgsql security definer
+set search_path = app, public, extensions, pg_temp as $$
+declare
+  v_user app_users := app.require_role('manager', 'distributor');
+  v_params jsonb;
+  v_replay jsonb;
+  v_result jsonb;
+  v_branch text;
+  v_count counts;
+  v_now timestamptz;
+begin
+  if p_request_id is null then raise exception 'REQUEST_ID_REQUIRED'; end if;
+  v_params := jsonb_build_object('count_id', p_count_id, 'expected_revision', p_expected_revision);
+  v_replay := app.request_replay(p_request_id, 'submit_count', v_user.id, v_params);
+  if v_replay is not null then return v_replay; end if;
+  -- Locate the immutable branch before locking; read all state again below.
+  select c.branch_id into v_branch from counts c where c.id = p_count_id;
+  v_now := app.lock_branches(v_branch);
+  select c.* into v_count from counts c where c.id = p_count_id for update;
+  if not found then raise exception 'COUNT_NOT_OPEN'; end if;
+  if v_count.branch_id is distinct from v_user.branch_id then raise exception 'FORBIDDEN'; end if;
+  if v_count.status not in ('draft', 'returned') then raise exception 'COUNT_LOCKED'; end if;
+  if v_count.frozen_since is null then raise exception 'COUNT_NOT_STARTED'; end if;
+  if p_expected_revision is distinct from v_count.revision then raise exception 'STALE_WRITE'; end if;
+  perform 1 from count_lines l where l.count_id = p_count_id order by l.item_id for update;
+  if exists (select 1 from count_lines l where l.count_id = p_count_id and l.state = 'uncounted') then
+    raise exception 'COUNT_INCOMPLETE';
+  end if;
+  update count_lines set effective_at = v_now, needs_recount = false
+  where count_id = p_count_id and (v_count.status = 'draft' or needs_recount);
+  update counts set status = 'submitted', submitted_by = v_user.id, submitted_at = v_now, frozen_since = null
+  where id = p_count_id;
+  v_result := jsonb_build_object('count_id', p_count_id, 'submitted_at', v_now);
+  perform app.log_action(v_user.id, 'submit_count', 'counts', p_count_id::text, v_params);
+  return app.request_store(p_request_id, 'submit_count', v_user.id, v_params, v_result);
+end;
+$$;
+
+create function public.review_count(p_request_id uuid, p_count_id uuid, p_action text,
+  p_item_ids text[] default null, p_note text default null) returns jsonb
+language plpgsql security definer
+set search_path = app, public, extensions, pg_temp as $$
+declare
+  v_owner app_users := app.require_role('owner');
+  v_action text := nullif(btrim(p_action), '');
+  v_note text := nullif(btrim(p_note), '');
+  v_params jsonb;
+  v_replay jsonb;
+  v_result jsonb;
+  v_branch text;
+  v_count counts;
+  v_now timestamptz;
+  v_item_id text;
+  v_status text;
+begin
+  if p_request_id is null then raise exception 'REQUEST_ID_REQUIRED'; end if;
+  if v_action is null or v_action not in ('approve', 'return') then raise exception 'FORBIDDEN'; end if;
+  v_params := jsonb_build_object('count_id', p_count_id, 'action', v_action, 'item_ids', p_item_ids, 'note', v_note);
+  v_replay := app.request_replay(p_request_id, 'review_count', v_owner.id, v_params);
+  if v_replay is not null then return v_replay; end if;
+  select c.branch_id into v_branch from counts c where c.id = p_count_id;
+  v_now := app.lock_branches(v_branch);
+  if v_action = 'approve' then
+    -- Baseline FKs need these locks. Take them before the count, matching
+    -- set_item_count_setup's items -> counts order instead of inverting it.
+    perform 1 from items i where exists (
+      select 1 from count_lines l where l.count_id = p_count_id and l.item_id = i.id
+    ) order by i.id for key share;
+  end if;
+  select c.* into v_count from counts c where c.id = p_count_id for update;
+  if not found or v_count.status <> 'submitted' then raise exception 'COUNT_NOT_SUBMITTED'; end if;
+  perform 1 from count_lines l where l.count_id = p_count_id order by l.item_id for update;
+  if v_action = 'approve' then
+    -- Eager setup recomputation is not the approval gate: recompute every
+    -- containers line under the parent lock before testing pending_setup.
+    for v_item_id in
+      select l.item_id from count_lines l join items i on i.id = l.item_id
+      where l.count_id = p_count_id and i.count_method = 'containers' order by l.item_id
+    loop
+      perform app.compute_count_line(p_count_id, v_item_id);
+    end loop;
+    if exists (select 1 from count_lines l where l.count_id = p_count_id and l.pending_setup) then
+      raise exception 'SETUP_INCOMPLETE';
+    end if;
+    insert into stock_baselines (branch_id, item_id, base_quantity, effective_at, source, ref_id, created_by)
+    select v_count.branch_id, l.item_id, l.base_quantity, l.effective_at, 'count', p_count_id, v_owner.id
+    from count_lines l where l.count_id = p_count_id order by l.item_id;
+    v_status := 'approved';
+  else
+    if v_note is null then raise exception 'NOTE_REQUIRED'; end if;
+    if (p_item_ids is not null and cardinality(p_item_ids) = 0) or exists (
+      select 1 from unnest(p_item_ids) as chosen(item_id)
+      where not exists (select 1 from count_lines l where l.count_id = p_count_id and l.item_id = chosen.item_id)
+    ) then raise exception 'ITEM_INVALID'; end if;
+    update count_lines set needs_recount = true, state = 'uncounted', entries = '{}',
+      base_quantity = null, pending_setup = false, calc = null, revision = revision + 1
+    where count_id = p_count_id and (p_item_ids is null or item_id = any(p_item_ids));
+    v_status := 'returned';
+  end if;
+  -- Submitted counts are already unfrozen; returning does not start a freeze.
+  update counts set status = v_status, reviewed_by = v_owner.id, reviewed_at = v_now, review_note = v_note
+  where id = p_count_id;
+  v_result := jsonb_build_object('count_id', p_count_id, 'status', v_status);
+  perform app.log_action(v_owner.id, 'review_count', 'counts', p_count_id::text, v_params);
+  return app.request_store(p_request_id, 'review_count', v_owner.id, v_params, v_result);
+end;
+$$;
+
+create function public.zero_branch_balance(p_request_id uuid, p_branch_id text) returns jsonb
+language plpgsql security definer
+set search_path = app, public, extensions, pg_temp as $$
+declare
+  v_owner app_users := app.require_role('owner');
+  v_branch text := nullif(btrim(p_branch_id), '');
+  v_params jsonb;
+  v_replay jsonb;
+  v_result jsonb;
+  v_now timestamptz;
+  v_items int;
+begin
+  if p_request_id is null then raise exception 'REQUEST_ID_REQUIRED'; end if;
+  v_params := jsonb_build_object('branch_id', v_branch);
+  v_replay := app.request_replay(p_request_id, 'zero_branch_balance', v_owner.id, v_params);
+  if v_replay is not null then return v_replay; end if;
+  v_now := app.lock_branches(v_branch);
+  if not exists (select 1 from branches b where b.id = v_branch and b.active) then raise exception 'BRANCH_INVALID'; end if;
+  perform app.require_not_frozen(v_branch);
+  insert into stock_baselines (branch_id, item_id, base_quantity, effective_at, source, created_by)
+  select v_branch, i.id, 0, v_now, 'owner_zero', v_owner.id from items i where i.active order by i.id;
+  get diagnostics v_items = row_count;
+  v_result := jsonb_build_object('branch_id', v_branch, 'items', v_items);
+  perform app.log_action(v_owner.id, 'zero_branch_balance', 'branches', v_branch, v_params);
+  return app.request_store(p_request_id, 'zero_branch_balance', v_owner.id, v_params, v_result);
+end;
+$$;
+
+-- Read-only owner entry point; calc's column grant remains closed to everyone.
+create function public.count_line_calcs(p_count_id uuid) returns jsonb
+language plpgsql security definer
+set search_path = app, public, extensions, pg_temp as $$
+declare
+  v_owner app_users := app.require_role('owner');
+begin
+  return coalesce((select jsonb_object_agg(l.item_id, l.calc) from count_lines l where l.count_id = p_count_id), '{}'::jsonb);
+end;
+$$;
+
+revoke all on function public.submit_count(uuid, uuid, int) from public, anon, authenticated;
+revoke all on function public.review_count(uuid, uuid, text, text[], text) from public, anon, authenticated;
+revoke all on function public.zero_branch_balance(uuid, text) from public, anon, authenticated;
+revoke all on function public.count_line_calcs(uuid) from public, anon, authenticated;
+grant execute on function public.submit_count(uuid, uuid, int) to authenticated;
+grant execute on function public.review_count(uuid, uuid, text, text[], text) to authenticated;
+grant execute on function public.zero_branch_balance(uuid, text) to authenticated;
+grant execute on function public.count_line_calcs(uuid) to authenticated;
