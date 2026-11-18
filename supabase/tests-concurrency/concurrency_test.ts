@@ -9,6 +9,7 @@ import { assert, assertEquals } from "jsr:@std/assert@1.0.13";
 import { begin, type Conn, connect, overlap, rpc, type RpcResult } from "./helpers.ts";
 
 const ITEM = "D-001"; // base unit مل; عبوة = 750 مل
+const ML = "مل";
 const BOTTLE = "عبوة";
 
 type Ctx = { a: Conn; b: Conn; admin: Conn; setup: Conn };
@@ -183,5 +184,145 @@ Deno.test("owner deny vs receipt: line denied, B gets LINE_NOT_PENDING; source n
     assertEquals((await lineState(setup, t.line)).status, "denied");
     assertEquals((await movements(setup, t.line, null, "BR-14")).sum, 0, "source net for the line = 0");
     assertEquals((await movements(setup, t.line, "transfer_in", null)).n, 0, "no transfer_in");
+  });
+});
+
+// G3 --------------------------------------------------------------------------------------------------
+
+function purchaseArgs(requestId: string) {
+  return { p_request_id: requestId, p_supplier_id: "S-01", p_lines: [{ item_id: ITEM, unit: ML, quantity: 100 }] };
+}
+
+/** 203 buys 100 مل of ITEM at BR-03 (committed). Returns the purchase line id. */
+async function purchase100(setup: Conn): Promise<string> {
+  const res = await committed(setup, "203", "create_purchase", purchaseArgs(crypto.randomUUID())) as { purchase_id: string };
+  const lines = await q<{ id: string }>(setup, `select id::text from purchase_lines where purchase_id = $1`, [res.purchase_id]);
+  assertEquals(lines.length, 1);
+  return lines[0].id;
+}
+
+function editTo(c: Conn, line: string, quantity: number) {
+  return rpc(c, "edit_purchase_line", {
+    p_request_id: crypto.randomUUID(), p_line_id: line, p_quantity: quantity, p_unit: ML, p_cost_total: null,
+  });
+}
+
+function voidLine(c: Conn, line: string) {
+  return rpc(c, "void_purchase_line", { p_request_id: crypto.randomUUID(), p_line_id: line });
+}
+
+async function purchaseLine(c: Conn, line: string) {
+  const rows = await q<{ base: string; voided: boolean }>(
+    c, `select base_quantity::text as base, voided_at is not null as voided from purchase_lines where id = $1`, [line]);
+  return { base: Number(rows[0].base), voided: rows[0].voided };
+}
+
+Deno.test("two purchase edits: both ok; line = 60; Σ movements = 60; history old values 100 then 80", async () => {
+  await withConns(async ({ a, b, admin, setup }) => {
+    const line = await purchase100(setup);
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "100");
+        return await editTo(a, line, 80);
+      },
+      async () => {
+        await begin(b, "100");
+        return await editTo(b, line, 60);
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    okValue(ra, "A's edit");
+    okValue(rb, "B's edit");
+    assertEquals((await purchaseLine(setup, line)).base, 60, "line base_quantity");
+    assertEquals((await movements(setup, line, null, null)).sum, 60, "Σ stock_movements for the line");
+    const hist = await q<{ q: string; action: string }>(
+      setup,
+      `select (old_values ->> 'quantity') as q, action from purchase_line_history
+        where purchase_line_id = $1 order by changed_at, id`,
+      [line],
+    );
+    assertEquals(hist.map((h) => [h.action, Number(h.q)]), [["edit", 100], ["edit", 80]]);
+  });
+});
+
+Deno.test("edit vs void: B's void ok; line voided; Σ movements = 0", async () => {
+  await withConns(async ({ a, b, admin, setup }) => {
+    const line = await purchase100(setup);
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "100");
+        return await editTo(a, line, 80);
+      },
+      async () => {
+        await begin(b, "100");
+        return await voidLine(b, line);
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    okValue(ra, "A's edit");
+    okValue(rb, "B's void");
+    assertEquals((await purchaseLine(setup, line)).voided, true, "line voided");
+    assertEquals((await movements(setup, line, null, null)).sum, 0, "Σ stock_movements for the line");
+  });
+});
+
+Deno.test("void vs edit: B's edit gets LINE_VOIDED; Σ movements = 0", async () => {
+  await withConns(async ({ a, b, admin, setup }) => {
+    const line = await purchase100(setup);
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "100");
+        return await voidLine(a, line);
+      },
+      async () => {
+        await begin(b, "100");
+        return await editTo(b, line, 80);
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    okValue(ra, "A's void");
+    assertError(rb, "LINE_VOIDED", "B's edit");
+    const st = await purchaseLine(setup, line);
+    assertEquals(st.voided, true);
+    assertEquals(st.base, 100, "a voided line keeps its quantity");
+    assertEquals((await movements(setup, line, null, null)).sum, 0, "Σ stock_movements for the line");
+  });
+});
+
+Deno.test("same request id twice: both return the same purchase_id; one purchase row", async () => {
+  await withConns(async ({ a, b, admin, setup }) => {
+    const r = crypto.randomUUID();
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "203");
+        return await rpc(a, "create_purchase", purchaseArgs(r));
+      },
+      async () => {
+        await begin(b, "203");
+        return await rpc(b, "create_purchase", purchaseArgs(r));
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    const pa = okValue(ra, "A's purchase").purchase_id;
+    const pb = okValue(rb, "B's purchase").purchase_id;
+    assert(typeof pa === "string" && pa.length > 0);
+    assertEquals(pb, pa, "the same purchase_id");
+    const rows = await q<{ id: string }>(setup, `select id::text from purchases where request_id = $1`, [r]);
+    assertEquals(rows.map((x) => x.id), [pa], "one purchase row");
+    const ins = await q<{ n: number }>(
+      setup,
+      `select count(*)::int as n from stock_movements m join purchase_lines l on l.id = m.ref_id
+        where l.purchase_id = $1 and m.kind = 'purchase_in'`,
+      [pa],
+    );
+    assertEquals(ins[0].n, 1, "one purchase_in");
   });
 });
