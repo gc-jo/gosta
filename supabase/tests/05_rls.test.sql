@@ -40,9 +40,9 @@ select throws_ok('select * from app_user_secrets', '42501');
 select throws_ok('select * from app_sessions', '42501');
 select throws_ok('select * from rpc_requests', '42501');
 select throws_ok($$insert into purchases(branch_id,supplier_id) values ('BR-01','S-01')$$, '42501');
-select is((select count(*) from items), 3::bigint, 'reference table readable by a valid session');
+select is((select count(*) from items), 6::bigint, 'reference table readable by a valid session');
 select is((select count(*) from branches), 6::bigint, 'branches readable by a valid session');
-select is((select count(*) from item_units), 6::bigint, 'item_units readable');
+select is((select count(*) from item_units), 10::bigint, 'item_units readable');
 select is((select count(*) from suppliers), 2::bigint, 'suppliers readable');
 select is((select count(*) from supplier_items), 2::bigint, 'supplier_items readable');
 select is((select count(*) from allowed_local_purchases), 1::bigint, 'allowed_local_purchases: own branch only');
@@ -67,7 +67,7 @@ select ok(not has_table_privilege('authenticated', 'public.balances', 'insert,up
 -- balances: own branch only
 select is((select count(*) from balances where branch_id = 'BR-02'), 0::bigint, 'manager gets no balances rows for another branch');
 select is((select count(*) from balances where branch_id <> 'BR-01'), 0::bigint, 'manager gets no balances rows outside own branch');
-select is((select array_agg(item_id order by item_id) from balances), array['D-001','D-002'], 'own rows are exactly the active items of own branch');
+select is((select array_agg(item_id order by item_id) from balances), array['D-001','D-002','D-004','D-005','D-006'], 'own rows are exactly the active items of own branch');
 select is((select base_quantity from balances where item_id = 'D-001'), 7500::numeric, 'own D-001 balance');
 select is(test.balance('BR-02', 'D-001'), 500::numeric, 'test.balance reads the true ledger while acting as a manager');
 
@@ -80,7 +80,7 @@ create function pg_temp.leak_qty(numeric) returns boolean language plpgsql cost 
   as $f$ begin insert into seen values ('qty', $1); return true; end $f$;
 select is((select count(*) from transfer_line_costs where pg_temp.leak_cost(cost_total)), 0::bigint, 'leak probe on transfer_line_costs runs');
 select is_empty($$select 1 from seen where src = 'cost'$$, 'transfer_line_costs: no cost_total reaches a caller function before the filter');
-select is((select count(*) from balances where pg_temp.leak_qty(base_quantity)), 2::bigint, 'leak probe on balances runs');
+select is((select count(*) from balances where pg_temp.leak_qty(base_quantity)), 5::bigint, 'leak probe on balances runs');
 select is_empty($$select 1 from seen where src = 'qty' and v in (500, 50)$$, 'balances: no other-branch quantity reaches a caller function');
 
 -- manager 202 (BR-02) ----------------------------------------------------------
@@ -107,7 +107,7 @@ select is((select base_quantity from balances where branch_id = 'BR-02' and item
 select is((select base_quantity from balances where branch_id = 'BR-02' and item_id = 'D-002'), 50::numeric, 'owner sees BR-02/D-002 = baseline 40 + later 10');
 select isnt((select baseline_at from balances where branch_id = 'BR-02' and item_id = 'D-002'), null, 'baseline_at set');
 select is((select base_quantity from balances where branch_id = 'BR-01' and item_id = 'D-001'), 7500::numeric, 'owner sees BR-01/D-001 = 7500');
-select is((select count(*) from balances), 10::bigint, 'owner sees every active branch x active item');
+select is((select count(*) from balances), 25::bigint, 'owner sees every active branch x active item');
 select test.reset_role();
 select is(test.balance('BR-02', 'D-001'), 500::numeric, 'test.balance after reset_role');
 
@@ -151,7 +151,7 @@ select is((select array_agg(n order by n) from (
     select p.pronamespace::regnamespace::text || '.' || p.proname as n from pg_proc p
     where p.pronamespace in ('public'::regnamespace, 'app'::regnamespace)
       and (has_function_privilege('authenticated', p.oid, 'execute') or has_function_privilege('anon', p.oid, 'execute'))) s),
-  array['app.my_branch','app.my_role','app.session_ok','public.admin_create_user','public.admin_set_secret','public.admin_set_user_active','public.admin_unlock_user','public.create_purchase','public.edit_purchase_line','public.logout','public.owner_resolve_transfer_line','public.receive_transfer','public.send_transfer','public.set_branch_feature','public.void_purchase_line'], 'functions executable by clients are exactly the three RLS helpers, the transfer RPCs, the purchase RPCs and the user-administration RPCs');
+  array['app.my_branch','app.my_role','app.session_ok','public.admin_create_user','public.admin_set_secret','public.admin_set_user_active','public.admin_unlock_user','public.create_purchase','public.edit_purchase_line','public.logout','public.owner_resolve_transfer_line','public.receive_transfer','public.send_transfer','public.set_branch_feature','public.set_container_tare','public.set_item_container','public.set_item_count_setup','public.set_item_unit','public.void_purchase_line'], 'functions executable by clients are exactly the three RLS helpers, the transfer RPCs, the purchase RPCs and the user-administration RPCs');
 -- tables created by later migrations start closed
 create table public.probe_tbl (id int generated always as identity primary key);
 select is_empty($$select 1 from information_schema.role_table_grants where table_name = 'probe_tbl' and grantee in ('anon','authenticated','PUBLIC')$$, 'new tables start closed');

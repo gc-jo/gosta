@@ -25,6 +25,34 @@ insert into item_units (item_id, unit_name, conversion_rate, active) values
   ('D-002', 'كرتونة', 1000, true),
   ('D-003', 'غم',     1,    true);
 
+-- Count-setup fixtures; existing items and units above stay unchanged.
+insert into items (id, name_ar, base_unit, item_type, sort_order, active) values
+  ('D-004', 'سيرب ساخن', 'غم',   'syrup', 4, true),
+  ('D-005', 'حليب سائل', 'عبوة', 'mixed', 5, true),
+  ('D-006', 'فلتر أميركان', 'حبة', 'mixed', 6, true);
+
+insert into item_units (item_id, unit_name, conversion_rate, active) values
+  ('D-004', 'غم',     1,  true),
+  ('D-005', 'عبوة',   1,  true),
+  ('D-005', 'كرتونة', 12, true),
+  ('D-006', 'حبة',    1,  true);
+
+update items set count_method = 'containers', net_grams_per_base_unit = 1 where id = 'D-004';
+update items set count_method = 'containers', net_grams_per_base_unit = 1000 where id = 'D-005';
+update items set counted = false where id = 'D-006';
+
+insert into item_containers (id, item_id, name_ar, content_base_quantity, variants) values
+  ('D-004-1L', 'D-004', 'عبوة 1 لتر', 1250,
+   array['glass_pump','glass_cap','plastic_pump','plastic_cap']),
+  ('D-005-1L', 'D-005', 'عبوة 1 لتر', 1, array['default']);
+
+-- plastic_cap deliberately has no tare: tests exercise pending setup.
+insert into container_tares (container_id, variant, tare_grams) values
+  ('D-004-1L', 'glass_pump',   620),
+  ('D-004-1L', 'glass_cap',    480),
+  ('D-004-1L', 'plastic_pump', 210),
+  ('D-005-1L', 'default',       40);
+
 -- suppliers ------------------------------------------------------------
 insert into suppliers (id, name_ar, phone, active) values
   ('S-01', 'مورد 1', null, true),
