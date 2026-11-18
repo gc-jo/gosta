@@ -78,7 +78,79 @@ export async function waitUntilBlockedBy(admin: Conn, pid: number, expectedBlock
   }
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * Opens a transaction on `c` acting as the seeded user `employeeNumber` (test.act_as: role authenticated
+ * and that user's seeded session). Everything until commit/rollback on `c` runs as that user.
+ */
+export async function begin(c: Conn, employeeNumber: string): Promise<void> {
+  await c.unsafe("begin");
+  await c.unsafe("select test.act_as($1)", [employeeNumber]);
+}
+
+/** Opens a transaction on `c` acting as service_role (test.act_as_service), as the login function does. */
+export async function beginService(c: Conn): Promise<void> {
+  await c.unsafe("begin");
+  await c.unsafe("select test.act_as_service()");
+}
+
+export type RpcResult = { ok: unknown } | { error: string };
+
+const NAME_RE = /^[a-z_][a-z0-9_]*$/;
+
+/**
+ * Calls public.<name>(p_key => value, ...) on `c`. Returns the function's result as `ok`, or the
+ * Postgres error message as `error` instead of throwing. Parameters are sent untyped, so the server
+ * resolves their types from the function signature; the driver then serialises each value for that type
+ * (objects and arrays for a jsonb parameter are JSON-encoded once by the driver). A json/jsonb result
+ * comes back parsed.
+ */
+export async function rpc(c: Conn, name: string, args: Record<string, unknown>): Promise<RpcResult> {
+  if (!NAME_RE.test(name)) throw new Error(`bad function name ${name}`);
+  const keys = Object.keys(args);
+  for (const k of keys) if (!NAME_RE.test(k)) throw new Error(`bad argument name ${k}`);
+  const list = keys.map((k, i) => `${k} => $${i + 1}`).join(", ");
+  const values = keys.map((k) => args[k] ?? null);
+  try {
+    const rows = await c.unsafe(`select public.${name}(${list}) as r`, values as never[]);
+    let r = (rows[0] as unknown as { r: unknown }).r;
+    if (typeof r === "string" && (r.startsWith("{") || r.startsWith("["))) {
+      try {
+        r = JSON.parse(r);
+      } catch { /* a plain text result */ }
+    }
+    return { ok: r };
+  } catch (e) {
+    return { error: (e as { message?: string }).message ?? String(e) };
+  }
+}
+
+/**
+ * Runs two transactions so that they really overlap: awaits `a` (A's statements, transaction left open),
+ * starts `b` without awaiting it, waits (through `watch.admin`, a third connection) until B's backend is
+ * blocked on a lock held by A's backend (fails after 5 s otherwise), then runs `commitA` and awaits `b`.
+ */
+export async function overlap<T, U>(
+  watch: { admin: Conn; a: Conn; b: Conn },
+  a: () => Promise<T>,
+  b: () => Promise<U>,
+  commitA: () => Promise<void>,
+): Promise<[T, U]> {
+  const pidA = await backendPid(watch.a);
+  const pidB = await backendPid(watch.b);
+  const ra = await a();
+  // keep a rejection from going unhandled while we wait; it is rethrown by the await below
+  const pb = b().then((v) => ({ v }), (e: unknown) => ({ e }));
+  try {
+    await waitUntilBlockedBy(watch.admin, pidB, pidA, 5000);
+  } finally {
+    await commitA();
+  }
+  const rb = await pb;
+  if ("e" in rb) throw rb.e;
+  return [ra, rb.v];
+}
+
+const UUID_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Makes the transaction already open on `c` act as an app session, the way a request through the
