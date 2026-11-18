@@ -71,13 +71,14 @@ supabase/
     0007_rpc_transfers.sql            send_transfer, receive_transfer, owner_resolve_transfer_line
     0008_rpc_purchases.sql            create_purchase, edit_purchase_line, void_purchase_line
     (0009 unused: the count work was blocked when 0010-0013 were merged, and a migration may not
-     be added below one already applied; counts are 0014 and 0015)
+     be added below one already applied; counts are 0015 and 0016)
     0010_rpc_users.sql                admin_* user RPCs, set_branch_feature, logout
     0011_login.sql                    login_verify, login_attach_auth_user, login_register_session
     0012_owner_session_recheck.sql    follow-up to 0010: admin_set_secret rechecks the caller's session after the row lock
     0013_secret_character_rules.sql   one rule for secret characters at set time and at login
-    0014_count_setup.sql              count setup tables and columns, owner setup RPCs, line recompute (Task 7b)
-    0015_rpc_counts.sql               open/close_count_window, start_count, save_count_line,
+    0014_login_log_cap.sql            follow-up to 0013: cap log rows of unknown-number login failures
+    0015_count_setup.sql              count setup tables and columns, owner setup RPCs, line recompute (Task 7b)
+    0016_rpc_counts.sql               open/close_count_window, start_count, save_count_line,
                                       discard_count, submit_count, review_count, zero_branch_balance
   functions/login/
     index.ts, derive.ts, derive_test.ts, login_integration_test.ts
@@ -516,10 +517,10 @@ Rules beyond spec section 6.3:
 > **Unblocked 2026-11-18.** The owner confirmed the physical counting procedure for every branch and supplied the count method (`docs/owner/2026-11-16-count-method-draft.md`, decisions in spec 8.1). Tasks 7b, 8 and 9 follow in that order.
 
 **Files:**
-- Create: `supabase/migrations/0014_count_setup.sql`, `supabase/tests/07b_count_setup.test.sql`
+- Create: `supabase/migrations/0015_count_setup.sql`, `supabase/tests/07b_count_setup.test.sql`
 - Modify: `supabase/seed.sql` (fixtures below)
 
-**Schema (in 0014; RLS enabled on every new table, rule (h)):**
+**Schema (in 0015; RLS enabled on every new table, rule (h)):**
 - `items`: add `counted boolean not null default true`, `count_method text not null default 'units'` check in (`units`,`containers`), `net_grams_per_base_unit numeric null` (> 0, finite; required when `count_method = 'containers'`, enforced by the setup RPC, not a table check, so import order does not matter).
 - `item_units`: add `count_visible boolean not null default true`.
 - `item_containers`: `id text primary key`, `item_id` → `items`, `name_ar` not blank, `content_base_quantity numeric null` (> 0, finite), `variants text[] not null default '{default}'` (non-empty; each element in `default`,`glass_pump`,`glass_cap`,`plastic_pump`,`plastic_cap`), `active boolean not null default true`.
@@ -537,7 +538,7 @@ Rules beyond spec section 6.3:
 **Recompute rule.** `set_item_container` (content change) and `set_container_tare` recompute every `counted` line using that container in counts with status `draft`, `submitted` or `returned`: lock those counts `for update` ordered by id, then call `compute_count_line`. Approved counts are never touched. This eager recompute is for the owner's screens; correctness does not depend on it, because approval recomputes again (Task 9).
 
 - [ ] **Step 1: Fixtures in `seed.sql`.** Keep every existing fixture unchanged (`D-001`, `D-002` stay `units`). Add, active and counted: `D-004` "سيرب ساخن" type `syrup`, base unit `غم`, `containers`, `net_grams_per_base_unit = 1`, container `D-004-1L` content 1250 with the four syrup variants, tares `glass_pump` 620, `glass_cap` 480, `plastic_pump` 210 (`plastic_cap` deliberately missing); `D-005` "حليب سائل" type `mixed`, base unit `عبوة`, unit `كرتونة` ×12, `containers`, `net_grams_per_base_unit = 1000`, container `D-005-1L` content 1, variant `default`, tare 40. Add `D-006` "فلتر أميركان", `units`, `counted = false`.
-- [ ] **Step 2: Run the whole suite before writing 0014.** Fixture changes can break tests that count all items or all units; list every test that changed and why in the commit message. Stock-rule assertions are never weakened; only counts of fixture rows may change.
+- [ ] **Step 2: Run the whole suite before writing 0015.** Fixture changes can break tests that count all items or all units; list every test that changed and why in the commit message. Stock-rule assertions are never weakened; only counts of fixture rows may change.
 - [ ] **Step 3: Write the failing tests `07b_count_setup.test.sql`.**
 
 | Test | Assertion |
@@ -553,7 +554,7 @@ Rules beyond spec section 6.3:
 | recompute on tare | then `set_container_tare('D-004-1L','plastic_cap',200)` → that line is no longer pending and equals the hand-computed value; a line in an `approved` count is unchanged |
 | replay | same request id and values → same result, one log row; different values → `REQUEST_ID_REUSED` |
 
-- [ ] **Step 4: Run.** Expected: FAIL. **Step 5: Write `0014_count_setup.sql`.** **Step 6: Run all suites.** Expected: PASS.
+- [ ] **Step 4: Run.** Expected: FAIL. **Step 5: Write `0015_count_setup.sql`.** **Step 6: Run all suites.** Expected: PASS.
 - [ ] **Step 7: Commit** — `feat(db): count setup data, owner setup RPCs, count line computation`.
 
 ---
@@ -561,7 +562,7 @@ Rules beyond spec section 6.3:
 ### Task 8: Count windows, explicit start, revisioned drafts
 
 **Files:**
-- Create: `supabase/migrations/0015_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
+- Create: `supabase/migrations/0016_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
 
 **Interfaces:**
 - Produces (each granted to `authenticated`):
@@ -628,7 +629,7 @@ Rules:
 ### Task 9: Count submit, review, baselines, zeroing
 
 **Files:**
-- Modify: `supabase/migrations/0015_rpc_counts.sql` (append; not merged until this task is done)
+- Modify: `supabase/migrations/0016_rpc_counts.sql` (append; not merged until this task is done)
 - Create: `supabase/tests/09_count_review.test.sql`
 
 **Interfaces:**
@@ -703,7 +704,7 @@ Rules:
 - **Replay with a secret.** `admin_create_user` and `admin_set_secret` pass the cleaned secret to `request_store`, which keeps a verifier on the request row itself. When `request_replay` returns a stored result, the RPC returns it only if `app.request_secret_ok(p_request_id, clean_secret)`, else `REQUEST_ID_REUSED`. The comparison is against the original request, not the user's current hash, so a later PIN change cannot alter the answer. A replay never changes the stored PIN.
 - `admin_create_user`: employee number normalised with `normalize_digits`; duplicate → `EMPLOYEE_NUMBER_TAKEN`; role/branch mismatch or unknown branch → `USER_INVALID`. `auth_user_id` stays null until first login. **Role `owner` is refused (`USER_INVALID`)**: owner accounts are not created through the app (the spec has one owner, provisioned at set-up), which also means `admin_set_secret` and `admin_set_user_active` can only ever meet an owner row that is the caller's own.
 - `set_branch_feature`: unknown or inactive branch → `BRANCH_INVALID`; a feature key outside the five allowed → `FEATURE_INVALID` (new code); upserts the row.
-- **Migration numbering.** This task keeps its assigned number, `0010_rpc_users.sql`, although `0009_rpc_counts.sql` (Tasks 8–9, paused) does not exist yet. A fresh database applies files in filename order, so adding 0009 later is fine locally and in CI. On a hosted project that has already had 0010 applied, an earlier-numbered file is refused by default; nothing is hosted yet, and plan 2's first task (applying migrations to `gosta-test`) must not start until 0009 exists or must apply with the out-of-order flag deliberately. **Resolved 2026-11-18:** 0009 stays unused; the count work is numbered 0014 and 0015 (after every merged file), so no out-of-order apply is ever needed.
+- **Migration numbering.** This task keeps its assigned number, `0010_rpc_users.sql`, although `0009_rpc_counts.sql` (Tasks 8–9, paused) does not exist yet. A fresh database applies files in filename order, so adding 0009 later is fine locally and in CI. On a hosted project that has already had 0010 applied, an earlier-numbered file is refused by default; nothing is hosted yet, and plan 2's first task (applying migrations to `gosta-test`) must not start until 0009 exists or must apply with the out-of-order flag deliberately. **Resolved 2026-11-18:** 0009 stays unused; the count work is numbered 0015 and 0016 (after every merged file), so no out-of-order apply is ever needed.
 - `admin_set_secret` and `admin_set_user_active(false)` call `app.revoke_sessions` and set `credential_version = credential_version + 1`, both under the user-row lock. `admin_set_secret` also zeroes `failed_attempts` and `locked_until`. Row-lock the `app_users` row first.
 - `admin_set_user_active(false)` on the caller's own row → `USER_INVALID`.
 - `admin_set_secret` on an owner row is allowed only for the caller's own row; it revokes the owner's other sessions but not the calling one.
