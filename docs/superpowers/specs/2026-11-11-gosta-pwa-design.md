@@ -99,8 +99,10 @@ Timestamps are stored in UTC and shown in `Asia/Amman`. Inventory periods are ca
 | Table | Columns |
 |---|---|
 | `branches` | `id` (e.g. `BR-01`), `name_ar`, `kind` (`branch` \| `warehouse` \| `waste`), `active` |
-| `items` | `id`, `name_ar`, `base_unit`, `item_type` (`syrup` \| `puree` \| `powder` \| `sauce` \| `cups` \| `mixed`), `sort_order`, `active` |
-| `item_units` | `item_id`, `unit_name`, `conversion_rate` (> 0; base unit row has rate 1), `active` |
+| `items` | `id`, `name_ar`, `base_unit`, `item_type` (`syrup` \| `puree` \| `powder` \| `sauce` \| `cups` \| `mixed`), `sort_order`, `active`, `counted` (false = excluded from counts, e.g. American filters), `count_method` (`units` \| `containers`, section 8.1), `net_grams_per_base_unit` (containers only: grams of net weight that make one base unit; 1 when the base unit is the gram) |
+| `item_units` | `item_id`, `unit_name`, `conversion_rate` (> 0; base unit row has rate 1), `active`, `count_visible` (this unit gets its own field on the count screen) |
+| `item_containers` | `id`, `item_id`, `name_ar` (e.g. "عبوة 1 لتر"), `content_base_quantity` (content of one **closed** container in the base unit; null until the owner sets it), `variants` (text[] of empty-container variants a weighed container can be: `{default}`, or for syrup `{glass_pump, glass_cap, plastic_pump, plastic_cap}`), `active` |
+| `container_tares` | `container_id`, `variant`, `tare_grams` (> 0: weight of the empty container with its attachment), `updated_by`, `updated_at` — one row per container and variant |
 | `suppliers` | `id`, `name_ar`, `phone`, `active` |
 | `supplier_items` | `supplier_id`, `item_id`, `active` |
 | `allowed_local_purchases` | `branch_id`, `item_id`, `active` |
@@ -122,7 +124,7 @@ Foreign keys and check constraints make the dirty data found in the current shee
 | `purchase_line_history` | `id`, `purchase_line_id`, `changed_by`, `changed_at`, `action` (`edit` \| `void`), `old_values` (json) |
 | `count_windows` | `branch_id`, `period_month`, `status` (`open` \| `closed`), `opened_by`, `opened_at`, `closed_by`, `closed_at` — one row per branch and month |
 | `counts` | `id`, `branch_id`, `period_month`, `status` (`draft` \| `submitted` \| `returned` \| `approved`), `submitted_by`, `submitted_at`, `reviewed_by`, `reviewed_at`, `review_note`, `frozen_since` (null when the branch is not frozen by this count), `revision` — one count per branch and month |
-| `count_lines` | `count_id`, `item_id`, `state` (`uncounted` \| `counted` \| `none`), `entries` (json: per-unit inputs; shape per item type, section 8), `base_quantity`, `needs_recount` (bool), `revision`, `effective_at` (the submit time of the round in which this line was last counted) |
+| `count_lines` | `count_id`, `item_id`, `state` (`uncounted` \| `counted` \| `none`), `entries` (json: exactly what the employee entered; shape per count method, section 8.1), `base_quantity`, `pending_setup` (bool: counted, but a tare or closed-container content it needs is not set yet, so `base_quantity` is null), `calc` (json: the rates, contents and tares used and when the result was computed), `needs_recount` (bool), `revision`, `effective_at` (the submit time of the round in which this line was last counted) |
 
 ### Ledger
 
@@ -208,7 +210,7 @@ Dating corrections at the original event time means a correction to something th
 
 ### 6.4 Counts and baselines
 
-> **Pending owner confirmation (raised 2026-11-11).** The physical counting procedure below — pausing stock use and movement, recording existing deliveries first, setting new arrivals aside — is not yet confirmed as workable for every branch. Nothing in section 6.4 or section 8 that depends on it is built until the owner confirms; if any branch cannot follow it, the freeze design is revisited.
+> **Confirmed by the owner on 2026-11-18 for every branch:** all four physical rules below, and the freeze design that depends on them. The owner opens the count for each branch at the end of the month; employees count from the app they are already signed in to.
 
 - **Start.** The manager presses "بدء الجرد" to begin; nothing is created and nothing is frozen before that. The start screen states the physical rules and requires a tick to confirm each:
   1. **Books first.** Every delivery already on the shelf has been received in the app, and everything already sent out has been recorded as a transfer. The screen lists this branch's shipments still waiting to be received and asks, for each, whether it is physically here; if one is, the manager must receive it before starting.
@@ -256,6 +258,7 @@ Visual design: keep the current app's look (emerald, Cairo font, rounded white c
 | التحويلات | Filter by date range, branch, status. Stuck (pending) transfers listed first with accept, deny, edit. A "فروقات الاستلام" filter lists every line received with a different quantity: sender, receiver, sent, received, reason, note. |
 | الجرد | Open/close a window per branch and month; review submitted counts; approve or return (whole count or ticked items, with a note). Review flags any item counted above "opening + received", which is physically impossible. |
 | الإعدادات | Users (create, deactivate, reset PIN, unlock), feature visibility per branch, zero a balance, database size, last successful backup. |
+| معاملات التحويل | Count setup per item (section 8.1): units and conversion rates and which units appear on the count screen, count method, containers with their closed content, and the empty weight of every container variant. Lists every counted item whose setup is incomplete. Replaces the "معاملات التحويل" tab of the old count sheet; its values are imported once at launch. |
 
 ### Idiot-proofing rules (every screen)
 
@@ -277,15 +280,52 @@ Fixed by this design:
 1. Owner opens a window for a branch and month.
 2. Manager counts **blind** (no expected quantity shown). Items in sort order, with search, a progress indicator, and a "remaining only" filter.
 3. Each item ends in one of two states: counted, or explicitly "لا يوجد". Blank is not zero.
-4. Multi-unit entry with conversion.
+4. Entry by count method, with conversion done by the app (section 8.1). The employee counts and weighs; the app checks, converts and adds up.
 5. Entries are saved to the server as a `draft` as they are typed; the manager can leave and resume on any device. Each save carries the revision it was based on; a late or duplicated save is rejected instead of overwriting newer work, and a save can never create a count or start a freeze. A rejected save is never reported as saved: the app keeps what the employee typed, reloads the stored value and compares; if they match it is marked saved, and if another phone stored something different both values are shown and the employee chooses.
 6. Submit is disabled until every item has a state. A summary screen precedes confirmation, and the submission names the revision that summary showed; if anything changed since, it is refused and the summary reloads. After submit the count is locked for the manager.
 7. Owner approves, or returns the whole count or selected items with a note; the manager recounts only those and resubmits.
-8. Approval creates the baselines (section 6.4).
-
-**Open:** the entry screen for each of the six item types (syrup, puree, powder, sauce, cups, mixed) is defined by a file the owner will supply by 2026-11-16. It will be added to this spec as section 8.1 and determines the shape of `count_lines.entries`. If it arrives later, launch uses a single generic multi-unit entry screen and the per-type screens follow after launch.
+8. Approval creates the baselines (section 6.4). The owner cannot approve while any line is `pending_setup` (section 8.1); the review screen lists those items and links to their setup.
 
 No branch has ever completed a count, so the first approved count in the new system is each branch's opening balance.
+
+### 8.1 Count entry by item
+
+Source: the owner's count method, `docs/owner/2026-11-16-count-method-draft.md`, with the owner's decisions of 2026-11-18. Where the draft describes the old design (a PIN per branch, a Google Sheet for factors and output), this section replaces it as stated.
+
+**Order on screen.** Sections in fixed order: puree (regular, then 1883), syrup (hot, then cold), sauces, powders, cups / lids / straws, miscellaneous. Before the first section the app reminds the employee to check the bar, the fridge and the store room. Order inside a section is `items.sort_order`. Items with `counted = false` never appear (American filters, shakers, butter bags, mini tart).
+
+**Every item has one count method.**
+
+*`units`* — one numeric field per unit with `count_visible = true`, whole numbers ≥ 0, plus "لا يوجد". Total = Σ quantity × rate. This covers:
+- powders: كيلو and غرام side by side (2 كيلو + 350 غرام = 2,350 g; 1,250 typed in غرام shows "1 كيلو و250 غرام" and stays 1,250 g);
+- cups, lids, straws: full carton, full bundle outside the counted cartons, loose pieces outside both; an open bundle is counted in pieces;
+- miscellaneous, each with its own visible units: cup holders (carton + bundle, no loose field), spoons / gloves / bags (bundle only), cheesecake moulds (mould = 14 + loose pieces), tart (pieces), visa and cash rolls (new rolls only), and the reviewed packs (Bom Bom, Code Red, Red Bull by box + cans outside it; soda and cream chargers by pack + unused outside it; cookies by piece).
+
+*`containers`* — for puree, syrup, sauces, liquid milk, condensed milk and Vitali cream. For each container size of the item:
+1. The employee enters **closed** and **open** counts (0 if none), presses "تأكيد العدد", then enters both again on a blank screen. If either differs, the app asks for a recount of that item; nothing is saved until the two entries match.
+2. The app shows **exactly as many weight fields as the confirmed open count**, each on its own card ("العبوة ٢ من ٤", grams) with progress ("تم إدخال ٢ من ٤ أوزان"). The employee weighs each open container alone, with its attachment, and types the scale reading as shown, then moves it aside so it is not weighed twice.
+3. Syrup only: next to each weight, one choice of **بمب** or **غطاي**, and a separate tick **الزجاجة بلاستك** (unticked = glass). Each container has its own choice. These map to the variants `glass_pump`, `glass_cap`, `plastic_pump`, `plastic_cap`. Other items use `default`.
+4. Changing the open count goes back to the counts screen. Weights that still belong to the same containers are kept; if the count drops, the employee picks which readings to remove.
+
+Items packed in outer units count those too, in their own fields (liquid milk: full cartons of 12 + closed bottles outside them + weights of open ones).
+
+**What the app computes** (never shown as a task to the employee):
+- net of an open container = scale reading − `tare_grams` of its container and variant;
+- line total in the base unit = Σ outer packs × rate + Σ closed × `content_base_quantity` + Σ net ÷ `net_grams_per_base_unit`, rounded to 3 decimals.
+  Examples: syrup, base unit غرام, `net_grams_per_base_unit = 1`; liquid milk, base unit عبوة (1 l), carton = 12, net ÷ 1,000; condensed milk, base unit علبة (397 g), net ÷ 397; Vitali cream, base unit غرام, closed content set per container size from 1,100 g/l.
+- Syrup is counted in grams. Closed content is set as a weight per container size; the label (e.g. 1,000 ml) only names the size. Sugar-free syrup is counted inside hot syrup; hot is one item, so hot containers that differ in content are separate container sizes of that one item.
+
+**Readings are checked when saved.** Counts are whole numbers ≥ 0. A reading must be > 0 grams; a reading below the known empty weight of its container and variant is refused with "الوزن أقل من وزن العبوة الفارغة، أعد الوزن". A reading is kept exactly as typed; nothing is rounded before the calculation.
+
+**Missing setup never blocks the employee.** Empty weights and closed contents are the owner's setup, done in the app (section 7, معاملات التحويل), and the employee never sees them. If a value the calculation needs is not set yet, the line is still saved and can be submitted: it is `counted` with `pending_setup = true` and no `base_quantity`, and the readings are kept. When the owner sets the missing value, every line of every **not yet approved** count that needs it is recomputed from its original readings, and `calc` records the values used and the time. The owner cannot approve a count while any of its lines is pending. Approved counts are never recomputed: their baselines are final, like every stored `base_quantity`.
+
+**Submission.** Every counted item needs a state; "لا يوجد" is an explicit zero; a blank field means not finished. A `containers` line is complete only when both counts are confirmed and every open container has a reading. There is no "could not count" state. The review screen lists unfinished items and takes the employee back to them.
+
+**Period.** A count belongs to the month the owner opened it for, also when counting runs past midnight.
+
+**Replaced from the old design.** Login is the employee's own number and PIN (section 5), not a PIN per branch. Factors live in the app, not a sheet tab. The old summary sheet is replaced by the owner's count review screen, which shows per branch and item the date, quantity, unit and state; every original reading, the values used and any recount stay stored.
+
+**Open, owner to supply before the first real count:** the final item list and each item's count method and visible units; container sizes and closed contents; empty weights (these may also be entered after a count); sauce sizes; whether the double count also applies to sauces (assumed yes, as proposed in the draft); the count frequency per branch; the policy for damaged and expired stock (not part of the count as specified).
 
 ## 9. Launch data
 
@@ -298,6 +338,7 @@ Owner clean-up before import:
 - Remove 6 empty supplier rows; add "مورد محلي" as a real supplier if it is still used.
 - Set `kind` for the warehouse (BR-14) and waste (BR-15) branches.
 - Assign an item type to each of the 89 items.
+- For counting (section 8.1): each item's `counted` flag, count method and visible units; containers and closed contents; empty weights where known. Imported from the old count sheet's "معاملات التحويل" tab; anything missing is entered later on the owner's setup screen.
 
 The import script validates everything and refuses to load on any error, listing each problem.
 
@@ -357,7 +398,8 @@ Order of cuts if time runs short: (1) polish on owner report screens, (2) per-ty
 | Item | By |
 |---|---|
 | Access to the two Supabase projects and Cloudflare Pages (keys entered through secure settings, never in chat) | Nov 13 |
-| Count rules file | Nov 16 |
+| Count rules file | Nov 16 — received; confirmed with decisions on Nov 18 (section 8.1) |
+| Count setup: item list with count methods, container sizes and contents, empty weights (section 8.1, "Open") | before the first real count |
 | Cleaned reference data with item types | Nov 20 |
 | Launch user list with roles and branches | Nov 24 |
 | Acceptance testing | Nov 24–26 |
