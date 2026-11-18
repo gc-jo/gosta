@@ -70,11 +70,16 @@ supabase/
     0006_rls.sql                      table grants + policies
     0007_rpc_transfers.sql            send_transfer, receive_transfer, owner_resolve_transfer_line
     0008_rpc_purchases.sql            create_purchase, edit_purchase_line, void_purchase_line
-    0009_rpc_counts.sql               open/close_count_window, start_count, save_count_line,
-                                      discard_count, submit_count, review_count, zero_branch_balance
+    (0009 unused: the count work was blocked when 0010-0013 were merged, and a migration may not
+     be added below one already applied; counts are 0015 and 0016)
     0010_rpc_users.sql                admin_* user RPCs, set_branch_feature, logout
     0011_login.sql                    login_verify, login_attach_auth_user, login_register_session
     0012_owner_session_recheck.sql    follow-up to 0010: admin_set_secret rechecks the caller's session after the row lock
+    0013_secret_character_rules.sql   one rule for secret characters at set time and at login
+    0014_login_log_cap.sql            follow-up to 0013: cap log rows of unknown-number login failures
+    0015_count_setup.sql              count setup tables and columns, owner setup RPCs, line recompute (Task 7b)
+    0016_rpc_counts.sql               open/close_count_window, start_count, save_count_line,
+                                      discard_count, submit_count, review_count, zero_branch_balance
   functions/login/
     index.ts, derive.ts, derive_test.ts, login_integration_test.ts
   tests/                              pgTAP, one file per migration, plus 20_reconciliation
@@ -289,6 +294,7 @@ rollback;
 
 Complete list of error codes (the front-end plan maps exactly these):
 `NOT_AUTHENTICATED`, `FORBIDDEN`, `FEATURE_HIDDEN`, `BRANCH_FROZEN`, `BRANCH_INVALID`, `ITEM_INVALID`, `UNIT_INVALID`, `QUANTITY_INVALID`, `COST_REQUIRED`, `COST_INVALID`, `LINES_EMPTY`, `LINES_INCOMPLETE`, `LINE_NOT_PENDING`, `DIFF_REASON_REQUIRED`, `SUPPLIER_INVALID`, `ITEM_NOT_ALLOWED`, `LINE_VOIDED`, `WINDOW_CLOSED`, `WINDOW_EXISTS`, `COUNT_LOCKED`, `COUNT_NOT_STARTED`, `COUNT_INCOMPLETE`, `COUNT_NOT_SUBMITTED`, `COUNT_NOT_OPEN`, `STALE_WRITE`, `ENTRIES_INVALID`, `NOTE_REQUIRED`, `USER_INVALID`, `SECRET_WEAK`, `SECRET_TOO_LONG`, `EMPLOYEE_NUMBER_TAKEN`, `REQUEST_ID_REUSED`, `REQUEST_ID_REQUIRED`, `FEATURE_INVALID`, `IMMUTABLE_ROW`.
+Added by Task 7b and Task 8 (count method, spec 8.1): `CONTAINER_INVALID`, `WEIGHT_INVALID`, `WEIGHT_BELOW_TARE`, `SETUP_INCOMPLETE`.
 
 - [ ] **Step 1: Write the failing test `04_helpers.test.sql`.** Functions that clients cannot call are tested as postgres with the claims set by hand (`select set_config('request.jwt.claims', …, true)` without changing role); client-visible behaviour is tested through the three RLS helpers.
 
@@ -506,12 +512,57 @@ Rules beyond spec section 6.3:
 
 ---
 
-### Task 8: Count windows, explicit start, revisioned drafts
+### Task 7b: Count setup data (spec 8.1)
 
-> **Blocked: pending owner confirmation of the physical counting procedure** (spec section 6.4). Do not start Task 8 or Task 9 until the owner confirms. Tasks 1–7 and 10–12 do not depend on it.
+> **Unblocked 2026-11-18.** The owner confirmed the physical counting procedure for every branch and supplied the count method (`docs/owner/2026-11-16-count-method-draft.md`, decisions in spec 8.1). Tasks 7b, 8 and 9 follow in that order.
 
 **Files:**
-- Create: `supabase/migrations/0009_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
+- Create: `supabase/migrations/0015_count_setup.sql`, `supabase/tests/07b_count_setup.test.sql`
+- Modify: `supabase/seed.sql` (fixtures below)
+
+**Schema (in 0015; RLS enabled on every new table, rule (h)):**
+- `items`: add `counted boolean not null default true`, `count_method text not null default 'units'` check in (`units`,`containers`), `net_grams_per_base_unit numeric null` (> 0, finite; required when `count_method = 'containers'`, enforced by the setup RPC, not a table check, so import order does not matter).
+- `item_units`: add `count_visible boolean not null default true`.
+- `item_containers`: `id text primary key`, `item_id` → `items`, `name_ar` not blank, `content_base_quantity numeric null` (> 0, finite), `variants text[] not null default '{default}'` (non-empty; each element in `default`,`glass_pump`,`glass_cap`,`plastic_pump`,`plastic_cap`), `active boolean not null default true`.
+- `container_tares`: `container_id` → `item_containers`, `variant` text, `tare_grams numeric not null` (> 0, finite), `updated_by`, `updated_at`; primary key (`container_id`,`variant`); a trigger refuses a `variant` not in its container's `variants`.
+- `count_lines`: add `pending_setup boolean not null default false`, `calc jsonb null`. Drop `count_lines_uncounted_has_no_quantity` (0003 stays unedited; this migration drops it) and add `count_lines_quantity_state`: `uncounted` → `base_quantity is null and not pending_setup`; `none` → `base_quantity = 0 and not pending_setup`; `counted` → `(base_quantity is null) = pending_setup`.
+- Clients: `select` on the four reference tables for `authenticated` (they are not secret; the count screen needs units, containers and variants). `container_tares` is readable by the owner only (employees never see empty weights, spec 8.1).
+
+**Interfaces** (each owner-only, takes `p_request_id`, replayable, logged, granted to `authenticated`):
+- `set_item_count_setup(p_request_id uuid, p_item_id text, p_counted boolean, p_count_method text, p_net_grams_per_base_unit numeric) returns jsonb`.
+- `set_item_unit(p_request_id uuid, p_item_id text, p_unit text, p_conversion_rate numeric, p_active boolean, p_count_visible boolean) returns jsonb` — creates or changes a unit. A rate change affects only rows entered afterwards (stored rates are never recomputed). The base unit keeps rate 1 and stays active (existing deferred trigger).
+- `set_item_container(p_request_id uuid, p_container_id text, p_item_id text, p_name_ar text, p_content_base_quantity numeric, p_variants text[], p_active boolean) returns jsonb`.
+- `set_container_tare(p_request_id uuid, p_container_id text, p_variant text, p_tare_grams numeric) returns jsonb`.
+- Internal `app.compute_count_line(p_count_id uuid, p_item_id text) returns void`: recomputes one `containers` line from its stored `entries` and the current setup (formula in spec 8.1), sets `base_quantity`, `pending_setup` and `calc` (`{"computed_at", "packs":[{unit,rate}], "containers":[{container_id, content, tares:{variant: grams}}]}`); never changes `entries` or `revision`. A missing content or tare → `pending_setup = true`, `base_quantity` null. Result rounded to 3 decimals; every input through `check_quantity`.
+
+**Recompute rule.** `set_item_container` (content change) and `set_container_tare` recompute every `counted` line using that container in counts with status `draft`, `submitted` or `returned`: lock those counts `for update` ordered by id, then call `compute_count_line`. Approved counts are never touched. This eager recompute is for the owner's screens; correctness does not depend on it, because approval recomputes again (Task 9).
+
+- [ ] **Step 1: Fixtures in `seed.sql`.** Keep every existing fixture unchanged (`D-001`, `D-002` stay `units`). Add, active and counted: `D-004` "سيرب ساخن" type `syrup`, base unit `غم`, `containers`, `net_grams_per_base_unit = 1`, container `D-004-1L` content 1250 with the four syrup variants, tares `glass_pump` 620, `glass_cap` 480, `plastic_pump` 210 (`plastic_cap` deliberately missing); `D-005` "حليب سائل" type `mixed`, base unit `عبوة`, unit `كرتونة` ×12, `containers`, `net_grams_per_base_unit = 1000`, container `D-005-1L` content 1, variant `default`, tare 40. Add `D-006` "فلتر أميركان", `units`, `counted = false`.
+- [ ] **Step 2: Run the whole suite before writing 0015.** Fixture changes can break tests that count all items or all units; list every test that changed and why in the commit message. Stock-rule assertions are never weakened; only counts of fixture rows may change.
+- [ ] **Step 3: Write the failing tests `07b_count_setup.test.sql`.**
+
+| Test | Assertion |
+|---|---|
+| owner only | `201` calls each setup RPC → `FORBIDDEN` |
+| method checks | `containers` without `net_grams_per_base_unit` → `QUANTITY_INVALID`; unknown method → `ENTRIES_INVALID` |
+| unit rate change | change `D-001` `عبوة` to 800; a purchase line stored before keeps 750 and its `base_quantity` |
+| base unit protected | set the base unit's rate to 2, or inactive → refused |
+| container checks | unknown item → `ITEM_INVALID`; empty or unknown variant → `CONTAINER_INVALID`; content ≤ 0 → `QUANTITY_INVALID` |
+| tare checks | variant not in the container's list → `CONTAINER_INVALID`; ≤ 0, `NaN` → `WEIGHT_INVALID` |
+| tares hidden | as `201`, `select count(*) from container_tares` = 0; as owner > 0 |
+| compute | build a `draft` count line for `D-004` by hand (as postgres) with entries from spec 8.1 shape; `compute_count_line` → expected grams; with a `plastic_cap` reading → `pending_setup`, null quantity, entries unchanged, revision unchanged |
+| recompute on tare | then `set_container_tare('D-004-1L','plastic_cap',200)` → that line is no longer pending and equals the hand-computed value; a line in an `approved` count is unchanged |
+| replay | same request id and values → same result, one log row; different values → `REQUEST_ID_REUSED` |
+
+- [ ] **Step 4: Run.** Expected: FAIL. **Step 5: Write `0015_count_setup.sql`.** **Step 6: Run all suites.** Expected: PASS.
+- [ ] **Step 7: Commit** — `feat(db): count setup data, owner setup RPCs, count line computation`.
+
+---
+
+### Task 8: Count windows, explicit start, revisioned drafts
+
+**Files:**
+- Create: `supabase/migrations/0016_rpc_counts.sql` (first half), `supabase/tests/08_count_entry.test.sql`
 
 **Interfaces:**
 - Produces (each granted to `authenticated`):
@@ -528,12 +579,14 @@ Rules:
 - `start_count` — **the only place a count is created and the only place a freeze starts.** Roles `manager`, `distributor`; own branch; lock branch; `require_feature(branch,'count')`.
   - Branch has a `draft` count → return it unchanged (idempotent re-entry).
   - Branch has a `returned` count → set `frozen_since = v_now` if null, return it (start of the recount).
-  - Otherwise the latest `open` window for the branch is required (`WINDOW_CLOSED`); if a count already exists for that window (`submitted` or `approved`) → `COUNT_LOCKED`; else create the `draft` with `frozen_since = v_now` and one `count_lines` row per **active** item, `state = 'uncounted'`.
+  - Otherwise the latest `open` window for the branch is required (`WINDOW_CLOSED`); if a count already exists for that window (`submitted` or `approved`) → `COUNT_LOCKED`; else create the `draft` with `frozen_since = v_now` and one `count_lines` row per item that is **active and `counted`**, `state = 'uncounted'`.
 - `save_count_line`: roles `manager`, `distributor`. `select … from counts where id = p_count_id for update`. No such count (for example, discarded) → `COUNT_NOT_OPEN`. Count not of the caller's branch → `FORBIDDEN`. Status not `draft`/`returned` → `COUNT_LOCKED`. `frozen_since is null` (returned, recount not started) → `COUNT_NOT_STARTED`. It never creates a count and never sets `frozen_since`.
   - `p_expected_revision` must equal the line's current `revision` (`STALE_WRITE`). On success the line's `revision` and the count's `revision` each increase by 1.
   - In a `returned` count only lines with `needs_recount = true` may be saved (`COUNT_LOCKED`).
-  - `p_state` in (`counted`,`none`,`uncounted`). `counted`: `p_entries` is a non-empty array of `{"unit","quantity"}`, each unit active for the item, each quantity ≥ 0, no unit twice (`ENTRIES_INVALID`); `base_quantity` = Σ quantity × current rate. `none`: entries null or `[]`; `base_quantity = 0`. `uncounted`: clears entries, `base_quantity = null`.
-  - This generic `entries` shape launches if the per-type rules file is late (spec section 8, "Open"). Per-type shapes arrive as a later migration that only widens validation.
+  - `p_state` in (`counted`,`none`,`uncounted`). `none`: entries null or `[]`; `base_quantity = 0`. `uncounted`: clears entries, `base_quantity` null, `pending_setup` false. `counted` depends on the item's `count_method` (spec 8.1):
+    - `units`: `p_entries` is a non-empty array of `{"unit","quantity"}`; each unit active **and `count_visible`** for the item; each quantity a whole number ≥ 0; no unit twice (`ENTRIES_INVALID`); `base_quantity` = Σ quantity × current rate; `calc` records the rates.
+    - `containers`: `p_entries` is `{"packs":[{"unit","quantity"}], "containers":[{"container_id","closed","closed_confirm","open","open_confirm","weights":[{"grams","variant"}]}]}`. `packs` may be empty and follows the `units` rules. `containers` is non-empty; each `container_id` an active container of this item, no container twice (`CONTAINER_INVALID`); `closed`, `open` whole numbers ≥ 0 and equal to their `_confirm` (`ENTRIES_INVALID`: the app only sends after the employee's two entries match, the database refuses anything else); `weights` has exactly `open` elements (`ENTRIES_INVALID`); each `variant` in the container's `variants` (`CONTAINER_INVALID`); each `grams` > 0 and finite (`WEIGHT_INVALID`) and, when the tare of that container and variant is set, ≥ that tare (`WEIGHT_BELOW_TARE`). Entries are stored exactly as sent; then `app.compute_count_line` sets `base_quantity`, `pending_setup` and `calc`. A missing tare or content does **not** refuse the save.
+  - The response adds `"pending_setup": bool`. It never returns a tare value (employees never see empty weights).
   - No `p_request_id`: the revision check makes a duplicate delivery fail with `STALE_WRITE`.
   - **`STALE_WRITE` means "this save was not applied", never "already saved".** The line may hold this phone's earlier duplicate or another phone's different value; the database cannot tell which. Contract for the client (built in plan 3, fixed here): keep the employee's entry on screen, refetch the line, compare stored `state` + `entries` with what the employee intended. Equal → mark saved and adopt the new revision. Different → show both values as a conflict and let the employee choose; choosing theirs re-saves with the fresh revision. The client must never show "تم الحفظ" on `STALE_WRITE` without that comparison.
 - `discard_count`: owner; lock branch; row lock; status must be `draft` or `returned` (`COUNT_NOT_OPEN`); deletes the lines and the count row, which lifts the freeze. Discarding a `returned` count throws the whole count away — the only way out of an abandoned recount; the owner screen must say so.
@@ -543,7 +596,7 @@ Rules:
 | Test | Assertion |
 |---|---|
 | no window | `201` calls `start_count` → `WINDOW_CLOSED` |
-| start creates and freezes | owner opens `BR-01`/`2026-11-01`; `start_count` → `frozen_since` not null, two lines (active items only), all `uncounted`, `revision = 0` |
+| start creates and freezes | owner opens `BR-01`/`2026-11-01`; `start_count` → `frozen_since` not null, one line per active counted item (`D-001`, `D-002`, `D-004`, `D-005`; not `D-003` inactive, not `D-006` excluded), all `uncounted`, `revision = 0` |
 | start is re-entrant | second `start_count` with a new request id → same `count_id`, same `frozen_since` |
 | freeze blocks | after start, before any save: `create_purchase` by `201` → `BRANCH_FROZEN` |
 | save | `D-001` rev 0, counted `[{"unit":"كرتونة","quantity":1},{"unit":"عبوة","quantity":2}]` → `base_quantity = 10500`, `line_revision = 1`, `count_revision = 1`, `counted = 1`, `total = 2` |
@@ -557,6 +610,16 @@ Rules:
 | **late save after discard** | owner discards; a save with the old `count_id` → `COUNT_NOT_OPEN`; no `counts` row exists; `create_purchase` by `201` succeeds |
 | close does not strand | start, owner closes the window → `save_count_line` still works; `discard_count` still works |
 | duplicate open | → `WINDOW_EXISTS` |
+| hidden unit | hide `D-001` `كرتونة` from counts (`set_item_unit … p_count_visible false`); saving with it → `ENTRIES_INVALID`; `عبوة` still works |
+| whole numbers | `units` quantity 1.5 → `ENTRIES_INVALID` |
+| syrup | `D-004`: `D-004-1L` closed 2/2, open 2/2, weights 1000 `glass_pump`, 700 `plastic_pump` → `base_quantity` = 2×1250 + (1000−620) + (700−210) = 3370, `pending_setup` false, `calc` names tares 620 and 210 |
+| confirm mismatch | closed 2, closed_confirm 3 → `ENTRIES_INVALID`; nothing stored |
+| weights count | open 2 with one weight → `ENTRIES_INVALID`; open 0 with no weights → ok |
+| below tare | 500 `glass_pump` (tare 620) → `WEIGHT_BELOW_TARE` |
+| unknown variant | `glass_lid` → `CONTAINER_INVALID`; other item's container → `CONTAINER_INVALID` |
+| **missing tare saves** | one weight `plastic_cap` (no tare set) → saved, `state = 'counted'`, `pending_setup = true`, `base_quantity` null, entries stored as sent; response has no tare value |
+| milk | `D-005`: packs 1 `كرتونة`, container closed 3/3, open 1/1, weight 640 `default` → 12 + 3 + (640−40)/1000 = 15.6 |
+| no tare leak | as `201`, no RPC response or readable table contains a tare value |
 
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Write the five functions.** **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): count windows, explicit start, revisioned draft entry`.
@@ -566,7 +629,7 @@ Rules:
 ### Task 9: Count submit, review, baselines, zeroing
 
 **Files:**
-- Modify: `supabase/migrations/0009_rpc_counts.sql` (append; not merged until this task is done)
+- Modify: `supabase/migrations/0016_rpc_counts.sql` (append; not merged until this task is done)
 - Create: `supabase/tests/09_count_review.test.sql`
 
 **Interfaces:**
@@ -580,12 +643,13 @@ Rules:
 
 - `submit_count`: roles `manager`, `distributor`; lock branch; row-lock the count. Not the caller's branch → `FORBIDDEN`; status not `draft`/`returned` → `COUNT_LOCKED`; `frozen_since is null` → `COUNT_NOT_STARTED`; `p_expected_revision <> counts.revision` → `STALE_WRITE` (the employee must confirm what the summary screen showed); any line `uncounted` → `COUNT_INCOMPLETE`. Sets `status = 'submitted'`, `submitted_by`, `submitted_at = v_now`, `frozen_since = null`. Sets `count_lines.effective_at = v_now` on every line when coming from `draft`; only on lines with `needs_recount = true` when coming from `returned`, then clears `needs_recount`. Works whether the window is open or closed.
 - `review_count`: owner; row-lock the count; must be `submitted` (`COUNT_NOT_SUBMITTED`).
-  - `approve`: one `stock_baselines` row per line, `base_quantity` = line's, `effective_at` = line's `effective_at`, `source = 'count'`, `ref_id = count_id`; status `approved`.
+  - `approve`: first, under the count's row lock, call `app.compute_count_line` for **every** `containers` line of the count, so the baselines use the setup as it is at approval even if an eager recompute (Task 7b) missed a concurrent save. Then any line still `pending_setup` → `SETUP_INCOMPLETE` (the whole approval is refused; nothing is written; the owner sets the missing values and approves again). Otherwise one `stock_baselines` row per line, `base_quantity` = line's, `effective_at` = line's `effective_at`, `source = 'count'`, `ref_id = count_id`; status `approved`. From then on the lines are never recomputed.
+  - `submit_count` treats a `pending_setup` line as counted: missing setup never blocks the employee (spec 8.1).
   - `return`: blank note → `NOTE_REQUIRED`. `p_item_ids` null → every line; otherwise only the listed lines (each must belong to the count, else `ITEM_INVALID`). Those lines get `needs_recount = true`, `state = 'uncounted'`, entries and `base_quantity` cleared, `revision + 1`. Status `returned`, `frozen_since` stays null until `start_count`.
 - `zero_branch_balance`: owner; lock branch; `require_not_frozen(branch)`; one baseline of 0 per active item, `effective_at = v_now`, `source = 'owner_zero'`.
 - An item activated after the count was started has no line and gets no baseline; its balance continues from movements. Accepted for launch.
 
-- [ ] **Step 1: Write the failing tests `09_count_review.test.sql`.** Setup for each: owner opens `BR-01`/`2026-11-01`, `201` calls `start_count`. Statement order inside one test transaction is real time order because every stamp is `clock_timestamp()` taken under the branch lock; the first test proves it.
+- [ ] **Step 1: Write the failing tests `09_count_review.test.sql`.** Setup for each: owner opens `BR-01`/`2026-11-01`, `201` calls `start_count`. Unless a test says otherwise, `D-004` and `D-005` are saved as `none` so the count can be submitted. Statement order inside one test transaction is real time order because every stamp is `clock_timestamp()` taken under the branch lock; the first test proves it.
 
 | Test | Assertion |
 |---|---|
@@ -606,6 +670,11 @@ Rules:
 | zero | purchases exist; owner zeroes `BR-01` → every active item `0`; a later purchase adds on top |
 | zero while frozen | → `BRANCH_FROZEN` |
 | manager cannot review | → `FORBIDDEN` |
+| pending submits | `D-004` saved with a `plastic_cap` weight (no tare) → `submit_count` succeeds |
+| pending blocks approval | then approve → `SETUP_INCOMPLETE`; no baseline rows for this count; status still `submitted` |
+| tare unblocks | owner sets the `plastic_cap` tare; approve → baseline for `D-004` equals the hand-computed value with that tare |
+| approval uses current setup | submit with all tares set; owner changes the `glass_pump` tare; approve → the `D-004` baseline uses the **new** tare; changing it again after approval changes no baseline and no line |
+| approved never recomputed | after approval, `set_item_container` content change → the approved line's `base_quantity` and `calc` unchanged |
 
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Append the three functions.** **Step 4: Run all tests.** Expected: PASS.
 - [ ] **Step 5: Commit** — `feat(db): count submit, owner review, baselines and zeroing`.
@@ -635,7 +704,7 @@ Rules:
 - **Replay with a secret.** `admin_create_user` and `admin_set_secret` pass the cleaned secret to `request_store`, which keeps a verifier on the request row itself. When `request_replay` returns a stored result, the RPC returns it only if `app.request_secret_ok(p_request_id, clean_secret)`, else `REQUEST_ID_REUSED`. The comparison is against the original request, not the user's current hash, so a later PIN change cannot alter the answer. A replay never changes the stored PIN.
 - `admin_create_user`: employee number normalised with `normalize_digits`; duplicate → `EMPLOYEE_NUMBER_TAKEN`; role/branch mismatch or unknown branch → `USER_INVALID`. `auth_user_id` stays null until first login. **Role `owner` is refused (`USER_INVALID`)**: owner accounts are not created through the app (the spec has one owner, provisioned at set-up), which also means `admin_set_secret` and `admin_set_user_active` can only ever meet an owner row that is the caller's own.
 - `set_branch_feature`: unknown or inactive branch → `BRANCH_INVALID`; a feature key outside the five allowed → `FEATURE_INVALID` (new code); upserts the row.
-- **Migration numbering.** This task keeps its assigned number, `0010_rpc_users.sql`, although `0009_rpc_counts.sql` (Tasks 8–9, paused) does not exist yet. A fresh database applies files in filename order, so adding 0009 later is fine locally and in CI. On a hosted project that has already had 0010 applied, an earlier-numbered file is refused by default; nothing is hosted yet, and plan 2's first task (applying migrations to `gosta-test`) must not start until 0009 exists or must apply with the out-of-order flag deliberately.
+- **Migration numbering.** This task keeps its assigned number, `0010_rpc_users.sql`, although `0009_rpc_counts.sql` (Tasks 8–9, paused) does not exist yet. A fresh database applies files in filename order, so adding 0009 later is fine locally and in CI. On a hosted project that has already had 0010 applied, an earlier-numbered file is refused by default; nothing is hosted yet, and plan 2's first task (applying migrations to `gosta-test`) must not start until 0009 exists or must apply with the out-of-order flag deliberately. **Resolved 2026-11-18:** 0009 stays unused; the count work is numbered 0015 and 0016 (after every merged file), so no out-of-order apply is ever needed.
 - `admin_set_secret` and `admin_set_user_active(false)` call `app.revoke_sessions` and set `credential_version = credential_version + 1`, both under the user-row lock. `admin_set_secret` also zeroes `failed_attempts` and `locked_until`. Row-lock the `app_users` row first.
 - `admin_set_user_active(false)` on the caller's own row → `USER_INVALID`.
 - `admin_set_secret` on an owner row is allowed only for the caller's own row; it revokes the owner's other sessions but not the calling one.
@@ -859,6 +928,20 @@ Write assertions 2–6 as `is()` / `is_empty()` checks in the same style.
 
 ---
 
+### Task 15: Count follow-ups deferred from Tasks 13 and 14
+
+Task 13 and Task 14 were built while counting was blocked; their count parts wait for Task 9.
+
+**Files:**
+- Modify: `supabase/tests-concurrency/concurrency_test.ts`, `supabase/tests/20_reconciliation.test.sql`
+
+- [ ] **Step 1: The three count rows of the Task 13 table** (start of count vs purchase, purchase vs start of count, purchase that began before submission), on `BR-03` as `203`, same helpers and style as the rest of the suite. `D-004` and `D-005` lines are saved as `none` so the count can be submitted.
+- [ ] **Step 2: One new race:** A = owner `set_container_tare` on a container used by a submitted count's line, B = owner `review_count approve` on that count. Either order: the approval either refuses with `SETUP_INCOMPLETE` (tare not yet visible) or writes a baseline computed with the new tare; never a baseline from a stale value, never a deadlock.
+- [ ] **Step 3: Task 14 count part.** In `20_reconciliation.test.sql` remove the `shortcut:` comment and add the full count of `BR-01` (started, saved — including one `containers` item with a weight — submitted, approved), one more send and receipt after it, and the plan's assertion 6: `balances` for `BR-01` equals the approved count plus movements after each line's `effective_at`, computed independently in the test. Keep the existing eight checks.
+- [ ] **Step 4: Run all suites.** Expected: PASS. **Step 5: Commit** — `test(db): count races and count reconciliation`.
+
+---
+
 ## Done means
 
 - `supabase db reset && supabase test db`, both Deno suites under `supabase/functions/`, and `supabase/tests-concurrency/` pass locally and in CI.
@@ -876,7 +959,8 @@ select set_eq(
         'public.open_count_window','public.close_count_window','public.start_count','public.save_count_line',
         'public.discard_count','public.submit_count','public.review_count','public.zero_branch_balance',
         'public.admin_create_user','public.admin_set_secret','public.admin_set_user_active','public.admin_unlock_user',
-        'public.set_branch_feature','public.logout']);
+        'public.set_branch_feature','public.logout',
+        'public.set_item_count_setup','public.set_item_unit','public.set_item_container','public.set_container_tare']);
 select is_empty(
   $$select p.proname from pg_proc p where p.pronamespace in ('public'::regnamespace, 'app'::regnamespace)
       and has_function_privilege('anon', p.oid, 'execute')$$, 'anon can execute nothing');
