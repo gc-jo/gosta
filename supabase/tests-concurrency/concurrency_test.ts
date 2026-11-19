@@ -458,6 +458,385 @@ Deno.test("same request id twice: both return the same purchase_id; one purchase
   });
 });
 
+// Count follow-ups (Task 15) ---------------------------------------------------------------------------
+
+/** Fresh month per committed scenario/run; only this scenario's draft/window is cleaned up. */
+async function withCountWindow(
+  body: (ctx: Ctx, month: string) => Promise<void>,
+  restoreTare = false,
+) {
+  await withConns(async (ctx) => {
+    const { a, b, setup } = ctx;
+    const months = await q<{ month: string }>(
+      setup,
+      `select (coalesce(max(period_month), date '2026-10-01') + interval '1 month')::date::text as month
+         from (select period_month from count_windows where branch_id = 'BR-03'
+               union all select period_month from counts where branch_id = 'BR-03') periods`,
+    );
+    const month = months[0].month;
+    await committed(setup, "100", "open_count_window", {
+      p_request_id: crypto.randomUUID(),
+      p_branch_id: "BR-03",
+      p_period_month: month,
+    });
+    let failure: unknown = null;
+    try {
+      await body(ctx, month);
+    } catch (e) {
+      failure = e;
+    } finally {
+      await rollbackQuietly(a);
+      await rollbackQuietly(b);
+      await rollbackQuietly(setup);
+      try {
+        if (restoreTare) {
+          await committed(setup, "100", "set_container_tare", {
+            p_request_id: crypto.randomUUID(),
+            p_container_id: "D-004-1L",
+            p_variant: "glass_pump",
+            p_tare_grams: 620,
+          });
+        }
+        const drafts = await q<{ id: string }>(
+          setup,
+          `select id::text from counts where branch_id = 'BR-03' and period_month = $1::date
+             and status in ('draft','returned')`,
+          [month],
+        );
+        for (const draft of drafts) {
+          await committed(setup, "100", "discard_count", {
+            p_request_id: crypto.randomUUID(),
+            p_count_id: draft.id,
+          });
+        }
+        await committed(setup, "100", "close_count_window", {
+          p_request_id: crypto.randomUUID(),
+          p_branch_id: "BR-03",
+          p_period_month: month,
+        });
+        const remaining = await q<{ closed: boolean; unfinished: number }>(
+          setup,
+          `select w.status = 'closed' as closed,
+                  (select count(*)::int from counts c where c.branch_id = w.branch_id
+                    and c.period_month = w.period_month and (c.status in ('draft','returned') or c.frozen_since is not null)) as unfinished
+             from count_windows w where w.branch_id = 'BR-03' and w.period_month = $1::date`,
+          [month],
+        );
+        assertEquals([...remaining], [{ closed: true, unfinished: 0 }]);
+      } catch (e) {
+        console.error("cleaning up count scenario failed:", e);
+        if (failure === null) failure = e;
+      }
+    }
+    if (failure !== null) throw failure;
+  });
+}
+
+/** Save all four fixture lines in the caller's open 203 transaction. */
+async function saveCount(
+  c: Conn,
+  count: string,
+  syrup = false,
+): Promise<number> {
+  let revision = 0;
+  for (const item of [ITEM, "D-002", "D-004", "D-005"]) {
+    const entries = item === ITEM
+      ? [{ unit: ML, quantity: 1000 }]
+      : item === "D-004" && syrup
+      ? {
+        packs: [],
+        containers: [{
+          container_id: "D-004-1L",
+          closed: 2,
+          closed_confirm: 2,
+          open: 2,
+          open_confirm: 2,
+          weights: [
+            { grams: 1000, variant: "glass_pump" },
+            { grams: 700, variant: "plastic_pump" },
+          ],
+        }],
+      }
+      : null;
+    const result = okValue(
+      await rpc(c, "save_count_line", {
+        p_count_id: count,
+        p_item_id: item,
+        p_expected_revision: 0,
+        p_state: entries === null ? "none" : "counted",
+        p_entries: entries,
+      }),
+      `save ${item}`,
+    );
+    revision = result.count_revision as number;
+  }
+  assertEquals(revision, 4, "four saved fixture lines");
+  return revision;
+}
+
+/** Stored baseline and calc of this test's syrup line, with the cutoff/author checked independently. */
+async function syrupBaseline(setup: Conn, count: string) {
+  const rows = await q<{
+    quantity: string;
+    line_quantity: string;
+    tare: string;
+    status: string;
+    cutoff: boolean;
+    owner: boolean;
+  }>(
+    setup,
+    `select b.base_quantity::text as quantity, l.base_quantity::text as line_quantity,
+            l.calc #>> '{containers,0,tares,glass_pump}' as tare, c.status,
+            b.effective_at = l.effective_at and l.effective_at = c.submitted_at as cutoff,
+            b.created_by = (select id from app_users where employee_number = '100') as owner
+       from stock_baselines b join counts c on c.id = b.ref_id
+       join count_lines l on l.count_id = c.id and l.item_id = b.item_id
+       where b.ref_id = $1 and b.source = 'count' and b.branch_id = 'BR-03' and b.item_id = 'D-004'`,
+    [count],
+  );
+  assertEquals(rows.length, 1, "exactly one syrup baseline for this count");
+  return {
+    quantity: Number(rows[0].quantity),
+    line_quantity: Number(rows[0].line_quantity),
+    tare: Number(rows[0].tare),
+    status: rows[0].status,
+    cutoff: rows[0].cutoff,
+    owner: rows[0].owner,
+  };
+}
+
+Deno.test("start of count vs purchase: purchase waits, then BRANCH_FROZEN and no purchase row", async () => {
+  await withCountWindow(async ({ a, b, admin, setup }, month) => {
+    const request = crypto.randomUUID();
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "203");
+        return await rpc(a, "start_count", {
+          p_request_id: crypto.randomUUID(),
+        });
+      },
+      async () => {
+        await begin(b, "203");
+        return await rpc(b, "create_purchase", purchaseArgs(request));
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    const count = okValue(ra, "A's start").count_id;
+    assertError(rb, "BRANCH_FROZEN", "B's purchase");
+    const rows = await q<{ frozen: boolean; month: string; lines: number }>(
+      setup,
+      `select frozen_since is not null as frozen, period_month::text as month,
+              (select count(*)::int from count_lines where count_id = c.id and state = 'uncounted' and revision = 0) as lines
+         from counts c where c.id = $1 and c.branch_id = 'BR-03'`,
+      [count],
+    );
+    assertEquals([...rows], [{ frozen: true, month, lines: 4 }]);
+    assertEquals(
+      [
+        ...await q(setup, `select id from purchases where request_id = $1`, [
+          request,
+        ]),
+      ],
+      [],
+      "the refused request wrote no purchase",
+    );
+    assertEquals(
+      [
+        ...await q(
+          setup,
+          `select request_id from rpc_requests where request_id = $1`,
+          [request],
+        ),
+      ],
+      [],
+      "the refused request stored no replay result",
+    );
+  });
+});
+
+Deno.test("purchase vs start of count: start waits, then movement predates the freeze", async () => {
+  await withCountWindow(async ({ a, b, admin, setup }, month) => {
+    const [ra, rb] = await overlap(
+      { admin, a, b },
+      async () => {
+        await begin(a, "203");
+        return await rpc(
+          a,
+          "create_purchase",
+          purchaseArgs(crypto.randomUUID()),
+        );
+      },
+      async () => {
+        await begin(b, "203");
+        return await rpc(b, "start_count", {
+          p_request_id: crypto.randomUUID(),
+        });
+      },
+      () => commit(a),
+    );
+    await commit(b);
+    const purchase = okValue(ra, "A's purchase").purchase_id;
+    const count = okValue(rb, "B's start").count_id;
+    const rows = await q<{ before_freeze: boolean; quantity: string }>(
+      setup,
+      `select m.occurred_at = p.created_at and m.occurred_at < c.frozen_since as before_freeze,
+              m.base_quantity::text as quantity
+         from purchases p join purchase_lines l on l.purchase_id = p.id
+         join stock_movements m on m.ref_id = l.id and m.ref_table = 'purchase_lines' and m.kind = 'purchase_in'
+         join counts c on c.id = $2 and c.branch_id = p.branch_id
+         where p.id = $1 and p.branch_id = 'BR-03' and c.period_month = $3::date`,
+      [purchase, count, month],
+    );
+    assertEquals([...rows], [{ before_freeze: true, quantity: "100" }]);
+  });
+});
+
+Deno.test("purchase transaction began before submission: movement follows all cutoffs and survives approval", async () => {
+  await withCountWindow(async ({ a, b, setup }) => {
+    const started = await committed(setup, "203", "start_count", {
+      p_request_id: crypto.randomUUID(),
+    }) as { count_id: string };
+    await begin(a, "203");
+    // Deliberately pin the transaction clock before B saves/submits; no overlap helper here.
+    const pinned = (await q<{ t: string }>(a, `select now()::text as t`))[0].t;
+    await begin(b, "203");
+    const revision = await saveCount(b, started.count_id);
+    okValue(
+      await rpc(b, "submit_count", {
+        p_request_id: crypto.randomUUID(),
+        p_count_id: started.count_id,
+        p_expected_revision: revision,
+      }),
+      "B's submit",
+    );
+    await commit(b);
+    const purchase = okValue(
+      await rpc(a, "create_purchase", purchaseArgs(crypto.randomUUID())),
+      "A's purchase after submission",
+    ).purchase_id;
+    await commit(a);
+    const ordering = await q<{ n: number; ordered: boolean }>(
+      setup,
+      `select count(*)::int as n,
+              bool_and($3::text::timestamptz < c.submitted_at and c.frozen_since is null
+                       and m.occurred_at = p.created_at and m.occurred_at > l.effective_at) as ordered
+         from counts c join count_lines l on l.count_id = c.id
+         join purchases p on p.id = $2 and p.branch_id = c.branch_id
+         join purchase_lines pl on pl.purchase_id = p.id
+         join stock_movements m on m.ref_id = pl.id and m.ref_table = 'purchase_lines' and m.kind = 'purchase_in'
+         where c.id = $1 and c.branch_id = 'BR-03'`,
+      [started.count_id, purchase, pinned],
+    );
+    assertEquals([...ordering], [{ n: 4, ordered: true }]);
+    await committed(setup, "100", "review_count", {
+      p_request_id: crypto.randomUUID(),
+      p_count_id: started.count_id,
+      p_action: "approve",
+    });
+    const balance = await q<{ quantity: string; baseline: string; n: number }>(
+      setup,
+      `select test.balance('BR-03', 'D-001')::text as quantity, b.base_quantity::text as baseline,
+              (select count(*)::int from stock_baselines where ref_id = $1 and source = 'count') as n
+         from stock_baselines b where b.ref_id = $1 and b.source = 'count'
+           and b.branch_id = 'BR-03' and b.item_id = 'D-001'`,
+      [started.count_id],
+    );
+    // Counted 1000 x 1 ml + purchased 100 x 1 ml = 1100 ml, regardless of previous runs.
+    assertEquals([...balance], [{ quantity: "1100", baseline: "1000", n: 4 }]);
+  });
+});
+
+for (const tareFirst of [true, false]) {
+  Deno.test(
+    tareFirst
+      ? "tare first: approval waits on setup and uses 600, baseline 3390"
+      : "approval first: tare update waits, approved baseline stays 3370",
+    async () => {
+      await withCountWindow(async ({ a, b, admin, setup }) => {
+        await committed(setup, "100", "set_container_tare", {
+          p_request_id: crypto.randomUUID(),
+          p_container_id: "D-004-1L",
+          p_variant: "glass_pump",
+          p_tare_grams: 620,
+        });
+        const started = await committed(setup, "203", "start_count", {
+          p_request_id: crypto.randomUUID(),
+        }) as { count_id: string };
+        await begin(setup, "203");
+        const revision = await saveCount(setup, started.count_id, true);
+        okValue(
+          await rpc(setup, "submit_count", {
+            p_request_id: crypto.randomUUID(),
+            p_count_id: started.count_id,
+            p_expected_revision: revision,
+          }),
+          "submit syrup count",
+        );
+        await commit(setup);
+        const tareArgs = {
+          p_request_id: crypto.randomUUID(),
+          p_container_id: "D-004-1L",
+          p_variant: "glass_pump",
+          p_tare_grams: 600,
+        };
+        const reviewArgs = {
+          p_request_id: crypto.randomUUID(),
+          p_count_id: started.count_id,
+          p_action: "approve",
+        };
+        // Both orders share the count lock: setup's recompute sees the submitted
+        // row until approval commits, then skips it because it is approved.
+        const [ra, rb] = await overlap(
+          { admin, a, b },
+          async () => {
+            await begin(a, "100");
+            return tareFirst
+              ? await rpc(a, "set_container_tare", tareArgs)
+              : await rpc(a, "review_count", reviewArgs);
+          },
+          async () => {
+            await begin(b, "100");
+            return tareFirst
+              ? await rpc(b, "review_count", reviewArgs)
+              : await rpc(b, "set_container_tare", tareArgs);
+          },
+          () => commit(a),
+        );
+        okValue(ra, "A's first RPC");
+        okValue(rb, "B's RPC after waiting for A");
+        // Before B commits, A's approval (when first) already has its final baseline.
+        if (!tareFirst) {
+          const approved = await syrupBaseline(setup, started.count_id);
+          assertEquals(approved.quantity, 3370);
+          assertEquals(approved.tare, 620);
+        }
+        await commit(b);
+        // New tare: 2 x 1250 + (1000 - 600) + (700 - 210) = 3390 g.
+        // Approval first: 2 x 1250 + (1000 - 620) + (700 - 210) = 3370 g, immutable thereafter.
+        assertEquals(await syrupBaseline(setup, started.count_id), {
+          quantity: tareFirst ? 3390 : 3370,
+          line_quantity: tareFirst ? 3390 : 3370,
+          tare: tareFirst ? 600 : 620,
+          status: "approved",
+          cutoff: true,
+          owner: true,
+        });
+        const tares = await q<{ quantity: string }>(
+          setup,
+          `select tare_grams::text as quantity from container_tares where container_id = 'D-004-1L' and variant = 'glass_pump'`,
+        );
+        assertEquals(
+          [...tares],
+          [{ quantity: "600" }],
+          "the new tare really committed",
+        );
+      }, true);
+    },
+  );
+}
+
 // G4 --------------------------------------------------------------------------------------------------
 
 /**
