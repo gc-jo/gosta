@@ -1,0 +1,82 @@
+import { assertEquals, assertMatch, assertNotEquals, assertThrows } from "jsr:@std/assert@1.0.13";
+import { isWellFormedString, checkAppOrigin, hasControlChar, checkDeriveSecret, deriveAuthPassword, sessionIdFromJwt } from "./derive.ts";
+
+Deno.test("deriveAuthPassword is deterministic, 64 hex chars, depends on both inputs", async () => {
+  const a = await deriveAuthPassword("k1", "u1");
+  assertEquals(a, await deriveAuthPassword("k1", "u1"));
+  assertMatch(a, /^[0-9a-f]{64}$/);
+  assertNotEquals(a, await deriveAuthPassword("k2", "u1"));
+  assertNotEquals(a, await deriveAuthPassword("k1", "u2"));
+});
+
+Deno.test("deriveAuthPassword matches a known HMAC-SHA-256 vector", async () => {
+  // RFC 4231 style check computed independently: HMAC-SHA256(key="key", msg="The quick brown fox jumps over the lazy dog")
+  assertEquals(
+    await deriveAuthPassword("key", "The quick brown fox jumps over the lazy dog"),
+    "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+  );
+});
+
+const jwt = (p: object) => `x.${btoa(JSON.stringify(p)).replace(/=+$/, "")}.y`;
+
+Deno.test("sessionIdFromJwt reads the claim and rejects a token without it", () => {
+  assertEquals(sessionIdFromJwt(jwt({ session_id: "abc" })), "abc");
+  assertThrows(() => sessionIdFromJwt(jwt({ sub: "u" })));
+});
+
+Deno.test("sessionIdFromJwt handles base64url characters and missing padding", () => {
+  // "?>?>?>" style bytes produce '+' and '/' in standard base64, '-' and '_' in base64url
+  const payload = { session_id: "s-é-ÿ", pad: "???>>>" };
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  const std = btoa(String.fromCharCode(...bytes));
+  const url = std.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  assertEquals(url.includes("-") || url.includes("_"), true, "test payload must exercise url-safe characters");
+  assertEquals(sessionIdFromJwt(`h.${url}.s`), "s-é-ÿ");
+  // lengths 1, 2 and 3 mod 4 (padding of 3, 2, 1 characters removed)
+  for (const id of ["a", "ab", "abc", "abcd"]) {
+    assertEquals(sessionIdFromJwt(jwt({ session_id: id })), id);
+  }
+});
+
+Deno.test("sessionIdFromJwt throws on strings that are not a JWT", () => {
+  assertThrows(() => sessionIdFromJwt("not-a-jwt"));
+  assertThrows(() => sessionIdFromJwt(""));
+  assertThrows(() => sessionIdFromJwt("a.@@@.c"));
+  assertThrows(() => sessionIdFromJwt("a.bm90anNvbg.c")); // payload "notjson"
+  assertThrows(() => sessionIdFromJwt(jwt({ session_id: 5 })));
+  assertThrows(() => sessionIdFromJwt(jwt({ session_id: "" })));
+});
+
+Deno.test("checkDeriveSecret fails closed on a missing or short secret", () => {
+  assertEquals(checkDeriveSecret(undefined), false);
+  assertEquals(checkDeriveSecret(""), false);
+  assertEquals(checkDeriveSecret("x".repeat(31)), false);
+  assertEquals(checkDeriveSecret("x".repeat(32)), true);
+  assertEquals(checkDeriveSecret("x".repeat(64)), true);
+});
+
+Deno.test("checkAppOrigin accepts plain http(s) origins only", () => {
+  for (const ok of ["http://127.0.0.1:3000", "https://app.example.com", "https://a.b.c:8443"]) assertEquals(checkAppOrigin(ok), true, ok);
+  for (const no of [undefined, null, "", "*", "app.example.com", "https://app.example.com/", "https://app.example.com/path", "ftp://x.com", "javascript:alert(1)", "https://a.com, https://b.com"]) {
+    assertEquals(checkAppOrigin(no as string | undefined), false, String(no));
+  }
+});
+
+Deno.test("hasControlChar: exactly Unicode Cc, U+0000-U+001F and U+007F-U+009F (same table as 10d_secret_characters.test.sql)", () => {
+  for (let n = 0; n <= 0x2ff; n++) {
+    const cc = n <= 0x1f || (n >= 0x7f && n <= 0x9f);
+    assertEquals(hasControlChar("ab" + String.fromCodePoint(n) + "cd"), cc, `U+${n.toString(16).padStart(4, "0")}`);
+  }
+  for (const n of [0x0, 0x9, 0xa, 0xd, 0x1f, 0x7f, 0x85, 0x9f]) assertEquals(hasControlChar(String.fromCodePoint(n)), true);
+  for (const ok of [" ", "\u00a0", "\u0600", "\u0661\u0662", "\u{1F600}", '"', "\\", "\u2028", "\u200f"]) assertEquals(hasControlChar(ok), false, JSON.stringify(ok));
+});
+
+Deno.test("isWellFormedString: lone surrogates are refused, pairs and BMP text are fine", () => {
+  assertEquals(isWellFormedString("abc \u0661 \u{1F600} \ud83d\ude00"), true);
+  for (const bad of ["\ud800", "\udc00", "a\ud800b", "\udc00\ud800", "\ud800\ud800", "x\udbff", "\udfffx"]) {
+    assertEquals(isWellFormedString(bad), false, JSON.stringify(bad));
+  }
+  // the regex fallback agrees with the built-in on a sample
+  const re = (s: string) => !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+  for (const s of ["", "a", "\u{1F600}", "\ud800", "\udc00\ud800", "ab\udc00"]) assertEquals(re(s), isWellFormedString(s));
+});
