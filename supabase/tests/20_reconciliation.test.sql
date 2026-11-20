@@ -1,6 +1,5 @@
--- shortcut: no count scenario or count assertion yet, add them when Tasks 8 and 9 land.
 begin;
-select plan(8);
+select plan(14);
 
 -- test-local helpers (rolled back with the transaction) ----------------------------------
 create schema t20;
@@ -73,6 +72,37 @@ select public.edit_purchase_line('e2000000-0000-4000-8000-000000000401',
   t20.plid('e2000000-0000-4000-8000-000000000301'), 5, 'عبوة', 10);
 select public.void_purchase_line('e2000000-0000-4000-8000-000000000402',
   t20.plid('e2000000-0000-4000-8000-000000000302'));
+select test.reset_role();
+
+-- Full BR-01 count, including weighed syrup; approval replaces earlier stock
+-- without changing the insert-only movements checked below.
+create temporary table count_scenario (id uuid);
+grant select, insert on count_scenario to authenticated;
+select test.act_as('100');
+select public.open_count_window('e2000000-0000-4000-8000-000000000501','BR-01','2026-11-01');
+select test.act_as('201');
+insert into count_scenario select (public.start_count('e2000000-0000-4000-8000-000000000502')->>'count_id')::uuid;
+select public.save_count_line((select id from count_scenario),'D-001',0,'counted','[{"unit":"عبوة","quantity":14}]');
+select public.save_count_line((select id from count_scenario),'D-002',0,'none',null);
+select public.save_count_line((select id from count_scenario),'D-004',0,'counted',
+ '{"packs":[],"containers":[{"container_id":"D-004-1L","closed":2,"closed_confirm":2,"open":2,"open_confirm":2,"weights":[{"grams":1000,"variant":"glass_pump"},{"grams":700,"variant":"plastic_pump"}]}]}');
+select public.save_count_line((select id from count_scenario),'D-005',0,'none',null);
+select public.submit_count('e2000000-0000-4000-8000-000000000503',(select id from count_scenario),4);
+select test.act_as('100');
+select public.review_count('e2000000-0000-4000-8000-000000000504',(select id from count_scenario),'approve');
+
+-- A new arrival after the count must add above its baselines, including a
+-- containers item's gram balance. These are real sends/receipts, not inserts.
+select test.act_as('301');
+select public.send_transfer('e2000000-0000-4000-8000-000000000105','BR-01',
+ '[{"item_id":"D-001","quantity":1,"unit":"عبوة","cost_total":2},
+   {"item_id":"D-004","quantity":10,"unit":"غم","cost_total":1}]');
+select test.act_as('201');
+select public.receive_transfer('e2000000-0000-4000-8000-000000000205',
+ t20.tid('e2000000-0000-4000-8000-000000000105'),
+ jsonb_build_array(
+   jsonb_build_object('line_id',t20.tlid('e2000000-0000-4000-8000-000000000105','D-001'),'quantity',1,'unit','عبوة'),
+   jsonb_build_object('line_id',t20.tlid('e2000000-0000-4000-8000-000000000105','D-004'),'quantity',10,'unit','غم')));
 select test.reset_role();
 
 -- Pin the scenario so no-op owner corrections cannot pass the reconciliation checks.
@@ -172,6 +202,55 @@ select is(
      and l.status = 'received'
      and t.from_branch in ('BR-01','BR-02','BR-14') and t.to_branch in ('BR-01','BR-02','BR-14')),
   0::numeric, 'received as sent retains exactly the sent base quantity after the rate change');
+
+-- Count scenario checks; the original eight assertions above are unchanged.
+select is(
+ (select row(c.status,c.frozen_since,c.revision)::text from counts c join count_scenario s on s.id=c.id where c.branch_id='BR-01'),
+ '(approved,,4)','count is approved at revision four and is unfrozen');
+-- D-001: 14 x 750 = 10500 ml. D-004: 2 x 1250 + (1000-620) + (700-210) = 3370 g.
+-- D-002 and D-005 explicitly none = 0, not uncounted.
+select is(
+ (select string_agg(concat_ws('|',l.item_id,l.state,trim_scale(l.base_quantity),l.pending_setup::text),';' order by l.item_id)
+  from count_lines l join counts c on c.id=l.count_id join count_scenario s on s.id=c.id where c.branch_id='BR-01'),
+ 'D-001|counted|10500|false;D-002|none|0|false;D-004|counted|3370|false;D-005|none|0|false',
+ 'stored count includes exact unit and weighed-container quantities');
+select is(
+ (select count(*) from stock_baselines b join count_scenario s on s.id=b.ref_id
+  join count_lines l on l.count_id=s.id and l.item_id=b.item_id join counts c on c.id=s.id
+  where b.branch_id='BR-01' and b.source='count' and b.base_quantity=l.base_quantity
+    and b.effective_at=l.effective_at and l.effective_at=c.submitted_at
+    and b.created_by=(select id from app_users where employee_number='100')),
+ 4::bigint,'approval writes all four baselines with the exact per-line cutoff and owner');
+select ok(
+ (select bool_and(m.occurred_at > l.effective_at)
+  from transfer_lines tl join transfers t on t.id=tl.transfer_id
+  join stock_movements m on m.ref_table='transfer_lines' and m.ref_id=tl.id and m.kind='transfer_in'
+  join count_lines l on l.item_id=tl.item_id join count_scenario s on s.id=l.count_id
+  where t.request_id='e2000000-0000-4000-8000-000000000105' and m.branch_id='BR-01'
+    and t.from_branch='BR-14' and t.to_branch='BR-01'),
+ 'post-count receipt movements follow the corresponding count cutoffs');
+
+-- balances requires real session claims, including for its owner-facing reads.
+select test.act_as('100');
+-- D-001: 10500 + 1 x 750 = 11250 ml; D-004: 3370 + 10 x 1 = 3380 g; the two none lines stay zero.
+select is(
+ (select string_agg(concat_ws('|',b.item_id,trim_scale(b.base_quantity)),';' order by b.item_id)
+  from balances b join count_lines l on l.item_id=b.item_id join count_scenario s on s.id=l.count_id where b.branch_id='BR-01'),
+ 'D-001|11250;D-002|0;D-004|3380;D-005|0',
+ 'balances include the post-count arrival above the hand-computed quantities');
+
+-- Task 14 assertion 6: independently sum the raw movements after each stored
+-- line cutoff. The expected side uses neither stock_baselines nor test.balance.
+select is_empty($$
+ select l.item_id from count_lines l join count_scenario s on s.id=l.count_id
+ join counts c on c.id=s.id and c.branch_id='BR-01'
+ left join balances b on b.branch_id=c.branch_id and b.item_id=l.item_id
+ where b.base_quantity is distinct from l.base_quantity + coalesce((
+   select sum(m.base_quantity) from stock_movements m
+   where m.branch_id='BR-01' and m.item_id=l.item_id and m.occurred_at > l.effective_at),0)
+    or b.baseline_at is distinct from l.effective_at
+$$,'BR-01 balances equal approved count plus independently summed later movements per line');
+select test.reset_role();
 
 select * from finish();
 rollback;
